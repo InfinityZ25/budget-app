@@ -222,3 +222,13 @@ When a user signs into WorkOS after linking data locally, the iOS app sends the 
 - Never commit `.env`, `.env.local`, Plaid secrets, WorkOS keys, OpenRouter keys, xAI keys, Convex deploy keys, token encryption keys, or real statements.
 - Do not move provider secrets to the iOS client. Provider keys belong behind the Go API.
 - Access tokens are encrypted before storage. Changing `TOKEN_ENCRYPTION_KEY` will make previously stored encrypted Plaid tokens unreadable.
+### Sevalla Backend Deployment
+
+The production development backend is deployed on Sevalla at:
+
+```text
+https://hynix-budget-api-n6by3.sevalla.app
+```
+
+The iOS client currently points to `https://hynix-budget-api-n6by3.sevalla.app/v1` in `ios/BudgetApp/Sources/BudgetApp/Networking/APIClient.swift`. Sevalla builds from the root `Dockerfile`, which compiles and runs `backend/cmd/api`. Runtime secrets are configured as Sevalla application environment variables; do not commit `.env`.
+

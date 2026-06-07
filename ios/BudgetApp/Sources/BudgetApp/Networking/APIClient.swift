@@ -7,7 +7,7 @@ struct APIClient: Sendable {
     var userID: String
 
     static var local: APIClient {
-        APIClient(baseURL: URL(string: "http://192.168.4.48:8080/v1")!, userID: BudgetAuthStorage.savedUserID ?? "local-user")
+        APIClient(baseURL: URL(string: "https://hynix-budget-api-n6by3.sevalla.app/v1")!, userID: BudgetAuthStorage.savedUserID ?? "local-user")
     }
 
     func accounts() async throws -> [Account] {
