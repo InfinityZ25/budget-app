@@ -1,0 +1,56 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>$(DEVELOPMENT_LANGUAGE)</string>
+	<key>CFBundleDisplayName</key>
+	<string>Budget</string>
+	<key>CFBundleExecutable</key>
+	<string>$(EXECUTABLE_NAME)</string>
+	<key>CFBundleIdentifier</key>
+	<string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>$(PRODUCT_NAME)</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>1.0</string>
+	<key>CFBundleURLTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleURLName</key>
+			<string>com.hynix.budgetapp.auth</string>
+			<key>CFBundleURLSchemes</key>
+			<array>
+				<string>budgetapp</string>
+			</array>
+		</dict>
+	</array>
+	<key>CFBundleVersion</key>
+	<string>1</string>
+	<key>FinanceKitManagedEntitlementEnabled</key>
+	<false/>
+	<key>LSRequiresIPhoneOS</key>
+	<true/>
+	<key>NSAppTransportSecurity</key>
+	<dict>
+		<key>NSAllowsLocalNetworking</key>
+		<true/>
+	</dict>
+	<key>NSCameraUsageDescription</key>
+	<string>Budget scans receipts so you can attach line items to transactions.</string>
+	<key>NSFinancialDataUsageDescription</key>
+	<string>Budget uses financial account data to show balances, transactions, budgets, and cashflow projections.</string>
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>Budget connects to the local development server on your Mac while testing.</string>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>Budget uses the microphone for voice conversations with your finance assistant.</string>
+	<key>NSPhotoLibraryUsageDescription</key>
+	<string>Budget can import receipt or statement images you select.</string>
+	<key>UILaunchScreen</key>
+	<dict/>
+</dict>
+</plist>

@@ -1,0 +1,15 @@
+{
+  "name": "budget-app",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "convex:dev": "convex dev",
+    "convex:deploy": "convex deploy",
+    "convex:codegen": "convex codegen"
+  },
+  "devDependencies": {
+    "@types/node": "^25.9.2",
+    "convex": "latest",
+    "typescript": "latest"
+  }
+}
