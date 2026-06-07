@@ -55,8 +55,6 @@ Generate the token encryption key with:
 openssl rand -base64 32
 ```
 
-Legacy Mongo variables are only needed for the one-time migration tool in `backend/cmd/migrate-convex`.
-
 ## Convex
 
 Install dependencies:

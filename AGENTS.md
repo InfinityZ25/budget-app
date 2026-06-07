@@ -1,6 +1,6 @@
 # Agent Handoff Guide
 
-This repo is a native iOS budgeting app plus a Go/Fiber backend and Convex database. Treat Convex as the source of truth. MongoDB is legacy only for `backend/cmd/migrate-convex`.
+This repo is a native iOS budgeting app plus a Go/Fiber backend and Convex database. Treat Convex as the only persistence layer for app data.
 
 ## High-Priority Rules
 
