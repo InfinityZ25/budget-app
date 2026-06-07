@@ -246,13 +246,21 @@ final class FinanceStore {
 
     func askBudgetAssistant(_ message: String) async throws -> BudgetAssistantReply {
         let reply = try await api.askBudgetAssistant(message)
+        try await refreshAfterBudgetAssistant()
+        return reply
+    }
+
+    func streamBudgetAssistant(_ message: String) -> AsyncThrowingStream<BudgetAssistantStreamEvent, Error> {
+        api.streamBudgetAssistant(message)
+    }
+
+    func refreshAfterBudgetAssistant() async throws {
         async let fetchedBudgets = api.budgets()
         async let fetchedTransactions = api.transactions(filter: transactionFilter)
         async let fetchedCashflowTrendTransactions = api.transactions(limit: 1000, filter: TransactionFilter())
         budgets = try await fetchedBudgets
         transactions = try await fetchedTransactions
         cashflowTrendTransactions = try await fetchedCashflowTrendTransactions
-        return reply
     }
 
     func projectNextMonth() async {

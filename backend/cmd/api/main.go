@@ -366,6 +366,7 @@ func (s *server) routes() *fiber.App {
 	v1.Delete("/budgets/:id", s.deleteBudget)
 	v1.Post("/budgets/autogenerate", s.autoBudgets)
 	v1.Post("/budgets/assistant/chat", s.budgetAssistantChat)
+	v1.Post("/budgets/assistant/chat/stream", s.budgetAssistantChatStream)
 	v1.Get("/goals", s.listGoals)
 	v1.Post("/goals", s.createGoal)
 	v1.Post("/cashflow/project", s.projectCashflow)
@@ -964,6 +965,68 @@ func (s *server) budgetAssistantChat(c *fiber.Ctx) error {
 	})
 }
 
+func (s *server) budgetAssistantChatStream(c *fiber.Ctx) error {
+	var req budgetAssistantRequest
+	if err := c.BodyParser(&req); err != nil {
+		return bad(c, err)
+	}
+	req.Message = strings.TrimSpace(req.Message)
+	if req.UserID == "" || req.Message == "" {
+		return bad(c, errors.New("user_id and message are required"))
+	}
+
+	c.Set(fiber.HeaderContentType, "text/event-stream")
+	c.Set(fiber.HeaderCacheControl, "no-cache")
+	c.Set(fiber.HeaderConnection, "keep-alive")
+	c.Set("X-Accel-Buffering", "no")
+
+	c.Context().SetBodyStreamWriter(func(w *bufio.Writer) {
+		sendSSE(w, "status", fiber.Map{"message": "Thinking through your budgets…"})
+		_ = w.Flush()
+
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		defer cancel()
+
+		var budgets []map[string]any
+		var transactions []map[string]any
+		sendSSE(w, "status", fiber.Map{"message": "Loading categories and transactions…"})
+		_ = w.Flush()
+		_ = s.convex.query(ctx, "finance:legacyListBudgets", fiber.Map{"userKey": req.UserID}, &budgets)
+		_ = s.convex.query(ctx, "finance:legacyListTransactions", fiber.Map{"userKey": req.UserID, "limit": 250, "sort": "posted_at", "direction": "desc"}, &transactions)
+
+		sendSSE(w, "status", fiber.Map{"message": "Classifying and planning changes…"})
+		_ = w.Flush()
+		plan, err := s.openRouterBudgetPlan(ctx, req.UserID, req.Message, budgets, transactions)
+		if err != nil {
+			plan = fallbackBudgetAssistantPlan(req.Message, budgets, transactions)
+			sendSSE(w, "notice", fiber.Map{"message": err.Error()})
+			_ = w.Flush()
+		}
+
+		sendSSE(w, "status", fiber.Map{"message": "Applying high-confidence updates…"})
+		_ = w.Flush()
+		result := s.applyBudgetAssistantPlan(ctx, req.UserID, plan, budgets)
+		reply := budgetAssistantResponseText(result)
+		for _, token := range chunkText(reply, 18) {
+			sendSSE(w, "token", fiber.Map{"delta": token})
+			_ = w.Flush()
+			time.Sleep(12 * time.Millisecond)
+		}
+		sendSSE(w, "done", fiber.Map{
+			"reply":           result.Reply,
+			"created_budgets": result.CreatedBudgets,
+			"updated_budgets": result.UpdatedBudgets,
+			"deleted_budgets": result.DeletedBudgets,
+			"classified":      result.Classified,
+			"needs_review":    result.NeedsReview,
+			"follow_ups":      result.FollowUps,
+			"created_at":      time.Now().UTC(),
+		})
+		_ = w.Flush()
+	})
+	return nil
+}
+
 type budgetAssistantResult struct {
 	Reply          string   `json:"reply"`
 	CreatedBudgets int      `json:"created_budgets"`
@@ -1048,6 +1111,41 @@ func (s *server) applyBudgetAssistantPlan(ctx context.Context, userID string, pl
 		result.FollowUps = []string{"I found transactions that need confirmation before I classify them. Tell me the merchant/category mapping you want, or classify one and apply it to similar transactions."}
 	}
 	return result
+}
+
+func budgetAssistantResponseText(reply budgetAssistantResult) string {
+	parts := []string{strings.TrimSpace(reply.Reply)}
+	if len(reply.FollowUps) > 0 {
+		questions := make([]string, 0, len(reply.FollowUps))
+		for _, followUp := range reply.FollowUps {
+			if trimmed := strings.TrimSpace(followUp); trimmed != "" {
+				questions = append(questions, "• "+trimmed)
+			}
+		}
+		if len(questions) > 0 {
+			parts = append(parts, "Questions:\n"+strings.Join(questions, "\n"))
+		}
+	}
+	return strings.Join(parts, "\n\n")
+}
+
+func chunkText(value string, size int) []string {
+	if size <= 0 {
+		size = 24
+	}
+	runes := []rune(value)
+	if len(runes) == 0 {
+		return []string{}
+	}
+	chunks := make([]string, 0, (len(runes)/size)+1)
+	for start := 0; start < len(runes); start += size {
+		end := start + size
+		if end > len(runes) {
+			end = len(runes)
+		}
+		chunks = append(chunks, string(runes[start:end]))
+	}
+	return chunks
 }
 
 func normalizeCategoryName(value string) string {

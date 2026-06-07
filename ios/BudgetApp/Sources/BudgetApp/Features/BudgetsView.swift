@@ -471,6 +471,7 @@ private struct BudgetAssistantView: View {
     ]
     @State private var draft = ""
     @State private var isSending = false
+    @State private var thinkingStatus: String?
     @State private var lastReply: BudgetAssistantReply?
 
     private let examples = [
@@ -499,7 +500,7 @@ private struct BudgetAssistantView: View {
                                 BudgetAssistantActionSummary(reply: lastReply)
                             }
                             if isSending {
-                                Label("Working on budgets…", systemImage: "sparkles")
+                                Label(thinkingStatus ?? "Thinking…", systemImage: "sparkles")
                                     .font(.caption.weight(.medium))
                                     .foregroundStyle(.secondary)
                                     .frame(maxWidth: .infinity, alignment: .leading)
@@ -526,6 +527,7 @@ private struct BudgetAssistantView: View {
                     Button {
                         messages = [BudgetAssistantMessage(role: .assistant, content: "Started a fresh budget planning session. Tell me the categories, limits, or cleanup you want.")]
                         lastReply = nil
+                        thinkingStatus = nil
                     } label: {
                         Image(systemName: "square.and.pencil")
                     }
@@ -539,15 +541,39 @@ private struct BudgetAssistantView: View {
         guard !text.isEmpty, !isSending else { return }
         draft = ""
         lastReply = nil
+        thinkingStatus = "Thinking…"
         messages.append(BudgetAssistantMessage(role: .user, content: text))
+        messages.append(BudgetAssistantMessage(role: .assistant, content: ""))
+        let assistantID = messages[messages.count - 1].id
         isSending = true
         do {
-            let reply = try await store.askBudgetAssistant(text)
-            lastReply = reply
-            messages.append(BudgetAssistantMessage(role: .assistant, content: responseText(from: reply)))
+            for try await event in store.streamBudgetAssistant(text) {
+                switch event {
+                case let .status(message):
+                    thinkingStatus = message
+                case let .token(delta):
+                    if let index = messages.firstIndex(where: { $0.id == assistantID }) {
+                        messages[index].content += delta
+                    }
+                case let .notice(message):
+                    thinkingStatus = message
+                case let .done(reply):
+                    lastReply = reply
+                    if let index = messages.firstIndex(where: { $0.id == assistantID }), messages[index].content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                        messages[index].content = responseText(from: reply)
+                    }
+                    thinkingStatus = "Finished"
+                    try await store.refreshAfterBudgetAssistant()
+                }
+            }
         } catch {
-            messages.append(BudgetAssistantMessage(role: .assistant, content: "I could not update budgets because the request failed: \(error.localizedDescription)"))
+            if let index = messages.firstIndex(where: { $0.id == assistantID }) {
+                messages[index].content = "I could not update budgets because the request failed: \(error.localizedDescription)"
+            } else {
+                messages.append(BudgetAssistantMessage(role: .assistant, content: "I could not update budgets because the request failed: \(error.localizedDescription)"))
+            }
         }
+        thinkingStatus = nil
         isSending = false
     }
 
@@ -574,7 +600,7 @@ private struct BudgetAssistantMessage: Identifiable, Hashable {
 
     let id = UUID()
     let role: Role
-    let content: String
+    var content: String
 }
 
 private struct BudgetAssistantCapabilityCard: View {
@@ -629,7 +655,18 @@ private struct BudgetAssistantBubble: View {
             if message.role == .user {
                 Spacer(minLength: 48)
             }
-            Text(message.content)
+            Group {
+                if message.content.isEmpty {
+                    HStack(spacing: 6) {
+                        ProgressView()
+                            .controlSize(.small)
+                        Text("Thinking…")
+                            .foregroundStyle(.secondary)
+                    }
+                } else {
+                    Text(message.content)
+                }
+            }
                 .font(.body)
                 .foregroundStyle(.primary)
                 .padding(.horizontal, 14)

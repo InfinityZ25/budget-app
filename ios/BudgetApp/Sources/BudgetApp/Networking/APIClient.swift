@@ -85,6 +85,43 @@ struct APIClient: Sendable {
         try await post("budgets/assistant/chat", body: ["user_id": userID, "message": message])
     }
 
+    func streamBudgetAssistant(_ message: String) -> AsyncThrowingStream<BudgetAssistantStreamEvent, Error> {
+        AsyncThrowingStream { continuation in
+            Task {
+                do {
+                    var request = URLRequest(url: baseURL.appending(path: "budgets/assistant/chat/stream"))
+                    request.httpMethod = "POST"
+                    request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+                    request.setValue("text/event-stream", forHTTPHeaderField: "Accept")
+                    request.httpBody = try encoder.encode(BudgetAssistantChatRequest(userID: userID, message: message))
+
+                    let (bytes, response) = try await URLSession.shared.bytes(for: request)
+                    guard let httpResponse = response as? HTTPURLResponse, 200..<300 ~= httpResponse.statusCode else {
+                        let status = (response as? HTTPURLResponse)?.statusCode ?? -1
+                        throw APIError.badStatus(status, "Streaming budget assistant request failed")
+                    }
+
+                    var eventName = "message"
+                    for try await line in bytes.lines {
+                        if line.hasPrefix("event:") {
+                            eventName = String(line.dropFirst("event:".count)).trimmingCharacters(in: .whitespaces)
+                        } else if line.hasPrefix("data:") {
+                            let payload = String(line.dropFirst("data:".count)).trimmingCharacters(in: .whitespaces)
+                            if let event = try decodeBudgetAssistantStreamEvent(name: eventName, payload: payload) {
+                                continuation.yield(event)
+                            }
+                        } else if line.isEmpty {
+                            eventName = "message"
+                        }
+                    }
+                    continuation.finish()
+                } catch {
+                    continuation.finish(throwing: error)
+                }
+            }
+        }
+    }
+
     func createStatement(_ draft: StatementDraft) async throws -> StatementUpload {
         try await post("statements", body: draft.payload(userID: userID))
     }
@@ -324,6 +361,26 @@ struct APIClient: Sendable {
             return nil
         }
     }
+
+    private func decodeBudgetAssistantStreamEvent(name: String, payload: String) throws -> BudgetAssistantStreamEvent? {
+        guard let data = payload.data(using: .utf8) else { return nil }
+        switch name {
+        case "status":
+            let decoded = try decoder.decode(AssistantStreamMessagePayload.self, from: data)
+            return .status(decoded.message)
+        case "token":
+            let decoded = try decoder.decode(AssistantStreamTokenPayload.self, from: data)
+            return .token(decoded.delta)
+        case "done":
+            let decoded = try decoder.decode(BudgetAssistantReply.self, from: data)
+            return .done(decoded)
+        case "notice":
+            let decoded = try decoder.decode(AssistantStreamMessagePayload.self, from: data)
+            return .notice(decoded.message)
+        default:
+            return nil
+        }
+    }
 }
 
 enum AssistantStreamEvent {
@@ -331,6 +388,23 @@ enum AssistantStreamEvent {
     case token(String)
     case done(AssistantReply)
     case notice(String)
+}
+
+enum BudgetAssistantStreamEvent {
+    case status(String)
+    case token(String)
+    case done(BudgetAssistantReply)
+    case notice(String)
+}
+
+private struct BudgetAssistantChatRequest: Encodable {
+    let userID: String
+    let message: String
+
+    enum CodingKeys: String, CodingKey {
+        case userID = "user_id"
+        case message
+    }
 }
 
 private struct AssistantChatRequest: Encodable {
