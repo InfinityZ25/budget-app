@@ -40,6 +40,28 @@ type config struct {
 	ConvexURL, ConvexDeployKey                                         string
 }
 
+type flexInt int
+
+func (v *flexInt) UnmarshalJSON(data []byte) error {
+	var number json.Number
+	if err := json.Unmarshal(data, &number); err == nil {
+		if value, err := number.Int64(); err == nil {
+			*v = flexInt(value)
+			return nil
+		}
+		if value, err := strconv.ParseFloat(number.String(), 64); err == nil {
+			*v = flexInt(math.Round(value))
+			return nil
+		}
+	}
+	var value float64
+	if err := json.Unmarshal(data, &value); err == nil {
+		*v = flexInt(math.Round(value))
+		return nil
+	}
+	return fmt.Errorf("invalid integer value %s", string(data))
+}
+
 type accountSource string
 
 const (
@@ -520,8 +542,8 @@ func (s *server) workOSCallback(c *fiber.Ctx) error {
 	email := strings.TrimSpace(strings.ToLower(authResp.User.Email))
 	if email != "" {
 		var owner struct {
-			Key      string `json:"key"`
-			Accounts int    `json:"accounts"`
+			Key      string  `json:"key"`
+			Accounts flexInt `json:"accounts"`
 		}
 		if err := s.convex.query(c.Context(), "finance:legacyFindDataOwnerByEmail", fiber.Map{"email": email, "excludeUserKey": userID}, &owner); err != nil {
 			return fail(c, err)
@@ -613,8 +635,8 @@ func (s *server) upsertWorkOSUser(ctx context.Context, workOSUserID, email, name
 
 func (s *server) recoverUserDataByEmail(ctx context.Context, userID string, email string) (fiber.Map, error) {
 	var owner struct {
-		Key      string `json:"key"`
-		Accounts int    `json:"accounts"`
+		Key      string  `json:"key"`
+		Accounts flexInt `json:"accounts"`
 	}
 	if err := s.convex.query(ctx, "finance:legacyFindDataOwnerByEmail", fiber.Map{"email": email, "excludeUserKey": userID}, &owner); err != nil {
 		return nil, err
@@ -875,8 +897,8 @@ func (s *server) importFinanceKit(c *fiber.Ctx) error {
 	}
 
 	var out struct {
-		Accounts     int `json:"accounts"`
-		Transactions int `json:"transactions"`
+		Accounts     flexInt `json:"accounts"`
+		Transactions flexInt `json:"transactions"`
 	}
 	args := fiber.Map{"userKey": req.UserID, "provider": "financeKit", "displayName": "Apple Wallet", "externalConnectionId": "apple-wallet", "accounts": accounts, "transactions": transactions}
 	if err := s.convex.mutation(c.Context(), "finance:legacyImportProviderSnapshot", args, &out); err != nil {
@@ -884,7 +906,7 @@ func (s *server) importFinanceKit(c *fiber.Ctx) error {
 		return fail(c, err)
 	}
 	log.Printf("financekit import complete user=%s accounts=%d transactions=%d", req.UserID, out.Accounts, out.Transactions)
-	return c.JSON(out)
+	return c.JSON(fiber.Map{"accounts": int(out.Accounts), "transactions": int(out.Transactions)})
 }
 
 func (s *server) createStatement(c *fiber.Ctx) error {
