@@ -27,10 +27,14 @@ struct FinanceKitSnapshot: Hashable {
 }
 
 enum FinanceKitImporter {
+    private static func log(_ message: String) {
+        NSLog("[FinanceKitImporter] %@", message)
+    }
+
     static var canUseNativeFinanceKit: Bool {
 #if canImport(FinanceKit)
         if #available(iOS 17.4, *) {
-            return entitlementEnabledInBuild
+            return true
         }
 #endif
         return false
@@ -41,45 +45,64 @@ enum FinanceKitImporter {
         guard #available(iOS 17.4, *) else {
             return "FinanceKit requires iOS 17.4 or later."
         }
-        guard entitlementEnabledInBuild else {
-            return "FinanceKit is compiled in, but disabled for this build until Apple's managed entitlement is granted and added to signing."
-        }
         return "Ready to request Apple Wallet financial data access."
 #else
         return "FinanceKit is not available in this SDK build."
 #endif
     }
 
-    static func loadSnapshot(limit: Int = 500) async throws -> FinanceKitSnapshot {
+    static func loadSnapshot(limit: Int = 500, progress: (@MainActor (String) -> Void)? = nil) async throws -> FinanceKitSnapshot {
 #if canImport(FinanceKit)
         if #available(iOS 17.4, *) {
-            guard entitlementEnabledInBuild else {
-                throw FinanceKitImportError.restricted
-            }
+            log("Checking data availability")
+            await progress?("Checking FinanceKit availability…")
             guard FinanceKit.FinanceStore.isDataAvailable(.financialData) else {
+                log("Financial data is unavailable")
                 throw FinanceKitImportError.unavailable
             }
             let store = FinanceKit.FinanceStore.shared
+            log("Checking authorization status")
+            await progress?("Checking Wallet permission…")
             let status = try await store.authorizationStatus()
+            log("Authorization status: \(String(describing: status))")
             let authorized: Bool
             switch status {
             case .authorized:
                 authorized = true
             case .notDetermined:
-                authorized = try await store.requestAuthorization() == .authorized
+                log("Requesting authorization")
+                await progress?("Waiting for Wallet permission…")
+                let requestedStatus = try await store.requestAuthorization()
+                log("Authorization request returned: \(String(describing: requestedStatus))")
+                authorized = requestedStatus == .authorized
             case .denied:
                 authorized = false
             @unknown default:
                 authorized = false
             }
             guard authorized else {
+                log("Authorization denied")
                 throw FinanceKitImportError.denied
             }
 
+            log("Reading accounts")
+            await progress?("Reading Wallet accounts…")
             let accounts = try await store.accounts(query: FinanceKit.AccountQuery())
+            log("Read \(accounts.count) accounts")
+            log("Reading balances")
+            await progress?("Reading Wallet balances…")
             let balances = try await store.accountBalances(query: FinanceKit.AccountBalanceQuery())
+            log("Read \(balances.count) balances")
+            log("Reading transactions")
+            await progress?("Reading Wallet transactions…")
             let transactions = try await store.transactions(query: FinanceKit.TransactionQuery(limit: limit))
-            let balanceByAccount = Dictionary(uniqueKeysWithValues: balances.map { ($0.accountID, $0) })
+            log("Read \(transactions.count) transactions")
+            let balanceByAccount = Dictionary(
+                balances.map { ($0.accountID, $0) },
+                uniquingKeysWith: preferredBalance
+            )
+            log("Preparing snapshot")
+            await progress?("Preparing Wallet import…")
             return FinanceKitSnapshot(
                 accounts: accounts.map { account in
                     mapAccount(account, balance: balanceByAccount[account.id])
@@ -89,10 +112,6 @@ enum FinanceKitImporter {
         }
 #endif
         throw FinanceKitImportError.unavailable
-    }
-
-    private static var entitlementEnabledInBuild: Bool {
-        Bundle.main.object(forInfoDictionaryKey: "FinanceKitManagedEntitlementEnabled") as? Bool == true
     }
 
 #if canImport(FinanceKit)
@@ -140,6 +159,7 @@ enum FinanceKitImporter {
             merchantName: transaction.merchantName ?? "",
             amountCents: signedCents,
             currencyCode: transaction.transactionAmount.currencyCode,
+            authorizedAt: transaction.transactionDate,
             postedAt: transaction.postedDate ?? transaction.transactionDate,
             pending: transaction.status == .pending || transaction.status == .authorized || transaction.status == .memo,
             locationName: "",
@@ -157,6 +177,20 @@ enum FinanceKitImporter {
             return cents(booked.amount.amount) * (booked.creditDebitIndicator == .debit ? -1 : 1)
         }
         return 0
+    }
+
+    @available(iOS 17.4, *)
+    private static func preferredBalance(_ current: FinanceKit.AccountBalance, _ next: FinanceKit.AccountBalance) -> FinanceKit.AccountBalance {
+        if next.available != nil {
+            return next
+        }
+        if current.available != nil {
+            return current
+        }
+        if next.booked != nil {
+            return next
+        }
+        return current
     }
 #endif
 

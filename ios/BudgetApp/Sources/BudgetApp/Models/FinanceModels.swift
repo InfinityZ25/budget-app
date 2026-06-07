@@ -26,6 +26,45 @@ struct Account: Identifiable, Codable, Hashable {
     }
 }
 
+extension Account {
+    var displayName: String {
+        let official = (officialName ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        if !official.isEmpty {
+            return official
+        }
+        return name
+    }
+
+    var isCredit: Bool {
+        type.lowercased() == "credit" || (subtype ?? "").localizedCaseInsensitiveContains("credit")
+    }
+
+    var normalizedCreditBalanceCents: Int64 {
+        guard isCredit else { return balanceCents }
+        if source == "financekit", let creditLimitCents, creditLimitCents > 0 {
+            return max(0, creditLimitCents - balanceCents)
+        }
+        return max(0, balanceCents)
+    }
+
+    var normalizedAvailableCreditCents: Int64 {
+        guard isCredit, let creditLimitCents, creditLimitCents > 0 else { return 0 }
+        if source == "financekit" {
+            return max(0, balanceCents)
+        }
+        return max(0, creditLimitCents - max(0, balanceCents))
+    }
+
+    var normalizedCreditLimitCents: Int64 {
+        max(0, creditLimitCents ?? 0)
+    }
+
+    var creditUtilization: Double {
+        guard normalizedCreditLimitCents > 0 else { return 0 }
+        return min(1, max(0, Double(normalizedCreditBalanceCents) / Double(normalizedCreditLimitCents)))
+    }
+}
+
 struct CategorySplit: Codable, Hashable, Identifiable {
     var id: String { categoryID + name + String(amountCents) }
     let categoryID: String
@@ -62,6 +101,7 @@ struct Transaction: Identifiable, Codable, Hashable {
     let merchantName: String?
     let amountCents: Int64
     let currencyCode: String
+    let authorizedAt: Date?
     let postedAt: Date
     let pending: Bool
     let locationName: String?
@@ -76,6 +116,7 @@ struct Transaction: Identifiable, Codable, Hashable {
         case merchantName = "merchant_name"
         case amountCents = "amount_cents"
         case currencyCode = "currency_code"
+        case authorizedAt = "authorized_at"
         case postedAt = "posted_at"
         case locationName = "location_name"
         case categorySplits = "category_splits"
@@ -131,6 +172,55 @@ struct TransactionFilter: Hashable {
     var amountMode: AmountMode = .any
     var sortField: SortField = .date
     var sortDirection: SortDirection = .desc
+    var accountID = ""
+    var source = ""
+    var isStartDateEnabled = false
+    var startDate = Calendar.current.date(byAdding: .month, value: -1, to: Date()) ?? Date()
+    var isEndDateEnabled = false
+    var endDate = Date()
+
+    var isDefault: Bool {
+        self == TransactionFilter()
+    }
+
+    var summaryLabels: [String] {
+        var labels: [String] = []
+        let trimmedSearch = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmedSearch.isEmpty {
+            labels.append("Search: \(trimmedSearch)")
+        }
+        let trimmedAmount = amountText.trimmingCharacters(in: .whitespacesAndNewlines)
+        if amountMode != .any, !trimmedAmount.isEmpty {
+            labels.append("\(amountMode.label) \(trimmedAmount)")
+        }
+        if !accountID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            labels.append("Account selected")
+        }
+        let trimmedSource = source.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmedSource.isEmpty {
+            labels.append("Source: \(Self.sourceLabel(trimmedSource))")
+        }
+        if isStartDateEnabled {
+            labels.append("From \(startDate.formatted(date: .abbreviated, time: .omitted))")
+        }
+        if isEndDateEnabled {
+            labels.append("To \(endDate.formatted(date: .abbreviated, time: .omitted))")
+        }
+        if sortField != .date || sortDirection != .desc {
+            labels.append("Sort: \(sortField.label), \(sortDirection.label)")
+        }
+        return labels
+    }
+
+    static func sourceLabel(_ source: String) -> String {
+        switch source {
+        case "plaid": "Plaid"
+        case "manual": "Manual"
+        case "statement": "Statement"
+        case "financekit": "FinanceKit"
+        default: source.capitalized
+        }
+    }
 
     var queryItems: [String: String] {
         var query: [String: String] = ["sort": sortField.rawValue, "direction": sortDirection.rawValue]
@@ -151,7 +241,35 @@ struct TransactionFilter: Hashable {
                 query["amount_lt"] = trimmedAmount
             }
         }
+        let trimmedAccountID = accountID.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmedAccountID.isEmpty {
+            query["account_id"] = trimmedAccountID
+        }
+        let trimmedSource = source.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmedSource.isEmpty {
+            query["source"] = trimmedSource
+        }
+        if isStartDateEnabled, isEndDateEnabled, startDate > endDate {
+            query["posted_from"] = Self.apiDate(endDate)
+            query["posted_to"] = Self.apiDate(startDate)
+        } else {
+            if isStartDateEnabled {
+                query["posted_from"] = Self.apiDate(startDate)
+            }
+            if isEndDateEnabled {
+                query["posted_to"] = Self.apiDate(endDate)
+            }
+        }
         return query
+    }
+
+    private static func apiDate(_ date: Date) -> String {
+        let formatter = DateFormatter()
+        formatter.calendar = Calendar(identifier: .gregorian)
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = .current
+        formatter.dateFormat = "yyyy-MM-dd"
+        return formatter.string(from: date)
     }
 }
 
@@ -171,6 +289,83 @@ struct Budget: Identifiable, Codable, Hashable {
         case categoryName = "category_name"
         case limitCents = "limit_cents"
         case spentCents = "spent_cents"
+    }
+}
+
+struct BudgetIncomeOverride: Identifiable, Codable, Hashable {
+    let id: String
+    let userID: String
+    let transactionID: String
+    let included: Bool
+    let createdAt: Date
+    let updatedAt: Date
+
+    enum CodingKeys: String, CodingKey {
+        case id, included
+        case userID = "user_id"
+        case transactionID = "transaction_id"
+        case createdAt = "created_at"
+        case updatedAt = "updated_at"
+    }
+}
+
+struct RecurringTransaction: Identifiable, Codable, Hashable {
+    let id: String
+    let userID: String
+    let kind: String
+    let status: String
+    let cadence: String
+    let normalizedKey: String
+    let merchantName: String
+    let categoryName: String?
+    let averageAmountCents: Int64
+    let lastAmountCents: Int64
+    let transactionCount: Int
+    let averageIntervalDays: Int
+    let confidence: Double
+    let firstSeenAt: Date
+    let lastSeenAt: Date
+    let nextExpectedAt: Date?
+    let transactionIDs: [String]
+    let createdAt: Date
+    let updatedAt: Date
+
+    enum CodingKeys: String, CodingKey {
+        case id, kind, status, cadence, confidence
+        case userID = "user_id"
+        case normalizedKey = "normalized_key"
+        case merchantName = "merchant_name"
+        case categoryName = "category_name"
+        case averageAmountCents = "average_amount_cents"
+        case lastAmountCents = "last_amount_cents"
+        case transactionCount = "transaction_count"
+        case averageIntervalDays = "average_interval_days"
+        case firstSeenAt = "first_seen_at"
+        case lastSeenAt = "last_seen_at"
+        case nextExpectedAt = "next_expected_at"
+        case transactionIDs = "transaction_ids"
+        case createdAt = "created_at"
+        case updatedAt = "updated_at"
+    }
+
+    var isIncome: Bool { kind == "income" }
+
+    var displayAmountCents: Int64 {
+        abs(averageAmountCents)
+    }
+
+    var cadenceLabel: String {
+        switch cadence {
+        case "weekly": "Weekly"
+        case "biweekly": "Every 2 weeks"
+        case "semimonthly": "Twice monthly"
+        case "monthly": "Monthly"
+        default: averageIntervalDays > 0 ? "Every \(averageIntervalDays)d" : "Irregular"
+        }
+    }
+
+    var confidenceLabel: String {
+        "\(Int((confidence * 100).rounded()))% confidence"
     }
 }
 
@@ -254,6 +449,11 @@ struct AssistantReply: Codable, Hashable {
 }
 
 struct BudgetAssistantReply: Codable, Hashable {
+    var id: String { proposalID ?? "\(createdAt.timeIntervalSince1970)-\(reply.hashValue)" }
+    var normalizedMode: String {
+        let value = (mode ?? "proposal").trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return value.isEmpty ? "proposal" : value
+    }
     let reply: String
     let createdBudgets: Int
     let updatedBudgets: Int
@@ -261,10 +461,14 @@ struct BudgetAssistantReply: Codable, Hashable {
     let classified: Int
     let needsReview: Int
     let followUps: [String]
+    let plan: BudgetAssistantPlan?
+    let proposalID: String?
+    let mode: String?
     let createdAt: Date
 
     enum CodingKeys: String, CodingKey {
-        case reply
+        case reply, plan, mode
+        case proposalID = "proposal_id"
         case createdBudgets = "created_budgets"
         case updatedBudgets = "updated_budgets"
         case deletedBudgets = "deleted_budgets"
@@ -272,6 +476,48 @@ struct BudgetAssistantReply: Codable, Hashable {
         case needsReview = "needs_review"
         case followUps = "follow_ups"
         case createdAt = "created_at"
+    }
+}
+
+struct BudgetAssistantPlan: Codable, Hashable {
+    var reply: String
+    var budgets: [BudgetAssistantBudgetAction]
+    var classifications: [BudgetAssistantClassification]
+    var followUps: [String]
+
+    enum CodingKeys: String, CodingKey {
+        case reply, budgets, classifications
+        case followUps = "follow_ups"
+    }
+}
+
+struct BudgetAssistantBudgetAction: Codable, Hashable, Identifiable {
+    var id: String { [operation, categoryName, period, String(limitCents)].joined(separator: "|") }
+    let operation: String
+    let categoryName: String
+    let period: String
+    let limitCents: Int64
+
+    enum CodingKeys: String, CodingKey {
+        case operation, period
+        case categoryName = "category_name"
+        case limitCents = "limit_cents"
+    }
+}
+
+struct BudgetAssistantClassification: Codable, Hashable, Identifiable {
+    var id: String { transactionID + "|" + categoryName }
+    let transactionID: String
+    let categoryName: String
+    let confidence: Double
+    let reason: String
+    let applyToSimilar: Bool
+
+    enum CodingKeys: String, CodingKey {
+        case confidence, reason
+        case transactionID = "transaction_id"
+        case categoryName = "category_name"
+        case applyToSimilar = "apply_to_similar"
     }
 }
 

@@ -6,7 +6,7 @@ options:
 settings:
   base:
     SWIFT_VERSION: "6.0"
-    DEVELOPMENT_TEAM: ""
+    DEVELOPMENT_TEAM: 764FPKS8YP
     CODE_SIGN_STYLE: Automatic
     SUPPORTED_PLATFORMS: "iphoneos iphonesimulator"
     SUPPORTS_MACCATALYST: NO
@@ -20,6 +20,14 @@ targets:
     dependencies:
       - framework: Vendor/LinkKit.xcframework
         embed: true
+    entitlements:
+      path: BudgetApp/BudgetApp.entitlements
+      properties:
+        com.apple.developer.financekit:
+          - financial-data
+        com.apple.developer.financekit.transaction-picker: true
+        com.apple.developer.pass-type-identifiers:
+          - $(AppIdentifierPrefix)*
     info:
       path: BudgetApp/Info.plist
       properties:
@@ -32,6 +40,7 @@ targets:
         NSMicrophoneUsageDescription: Budget uses the microphone for voice conversations with your finance assistant.
         NSPhotoLibraryUsageDescription: Budget can import receipt or statement images you select.
         NSFinancialDataUsageDescription: Budget uses financial account data to show balances, transactions, budgets, and cashflow projections.
+        FinanceKitManagedEntitlementEnabled: true
         NSAppTransportSecurity:
           NSAllowsLocalNetworking: true
     settings:

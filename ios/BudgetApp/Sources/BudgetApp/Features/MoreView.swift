@@ -346,13 +346,15 @@ private struct AssistantThreadsView: View {
 struct ReceiptScannerView: View {
     @State private var showingScanner = false
     @State private var scannedPages = 0
+    @State private var recognizedText = ""
+    @State private var parsedItems: [ReceiptLineItemDraft] = []
 
     var body: some View {
         List {
             Section {
                 Label("On-device receipt scanning", systemImage: "doc.viewfinder")
                     .font(.headline)
-                Text("Scan a receipt with the iPhone document camera. Line-item OCR and category confirmation are the next processing step.")
+                Text("Scan a receipt with the iPhone document camera. Text is recognized on device and converted into editable receipt line items.")
                     .foregroundStyle(.secondary)
                 Button {
                     showingScanner = true
@@ -365,16 +367,41 @@ struct ReceiptScannerView: View {
                         .foregroundStyle(.secondary)
                 }
             }
-            Section("Manual line item example") {
-                HStack { Text("Produce"); Spacer(); Text("$28.40") }
-                HStack { Text("Household"); Spacer(); Text("$16.12") }
-                HStack { Text("Snacks"); Spacer(); Text("$9.08") }
+            Section("Parsed line items") {
+                if parsedItems.isEmpty {
+                    Text(scannedPages == 0 ? "Scan a receipt to preview parsed items." : "No line items were confidently detected. You can still use the raw OCR text below.")
+                        .foregroundStyle(.secondary)
+                }
+                ForEach(parsedItems) { item in
+                    HStack {
+                        VStack(alignment: .leading, spacing: 3) {
+                            Text(item.name)
+                            if !item.categoryName.isEmpty {
+                                Text(item.categoryName)
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+                        Spacer()
+                        Text(AppDesign.money(item.amountCents))
+                            .monospacedDigit()
+                    }
+                }
+            }
+            if !recognizedText.isEmpty {
+                Section("Raw OCR") {
+                    Text(recognizedText)
+                        .font(.caption.monospaced())
+                        .textSelection(.enabled)
+                }
             }
         }
         .navigationTitle("Receipt")
         .sheet(isPresented: $showingScanner) {
-            DocumentScannerView { pageCount in
-                scannedPages = pageCount
+            DocumentScannerView { result in
+                scannedPages = result.pageCount
+                recognizedText = result.recognizedText
+                parsedItems = result.lineItems
                 showingScanner = false
             }
         }

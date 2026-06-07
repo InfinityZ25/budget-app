@@ -45,6 +45,7 @@
 /* End PBXCopyFilesBuildPhase section */
 
 /* Begin PBXFileReference section */
+		A11F1C0A8B8E4F7D9D4A0001 /* BudgetApp.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = BudgetApp.entitlements; sourceTree = "<group>"; };
 		08C342063549551629256C2C /* AppDesign.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppDesign.swift; sourceTree = "<group>"; };
 		118FF56C24917FF7C99CF7F9 /* DocumentScannerView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DocumentScannerView.swift; sourceTree = "<group>"; };
 		11EDC4FD4779AC1C0A6467FA /* AddDataView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AddDataView.swift; sourceTree = "<group>"; };
@@ -152,6 +153,7 @@
 		E7B3E1F17E00FB7963AA3BF8 /* BudgetApp */ = {
 			isa = PBXGroup;
 			children = (
+				A11F1C0A8B8E4F7D9D4A0001 /* BudgetApp.entitlements */,
 				345B8B1D2F7640B5BD488CC5 /* BudgetApp.swift */,
 				299D7DF29FFE460E0EAC9D31 /* FinanceStore.swift */,
 				601308601949744C902D3365 /* RootView.swift */,
@@ -254,6 +256,7 @@
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = "";
 				CODE_SIGN_IDENTITY = "iPhone Developer";
+				CODE_SIGN_ENTITLEMENTS = BudgetApp/BudgetApp.entitlements;
 				FRAMEWORK_SEARCH_PATHS = (
 					"$(inherited)",
 					"\"Vendor\"",
@@ -346,6 +349,7 @@
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = "";
 				CODE_SIGN_IDENTITY = "iPhone Developer";
+				CODE_SIGN_ENTITLEMENTS = BudgetApp/BudgetApp.entitlements;
 				FRAMEWORK_SEARCH_PATHS = (
 					"$(inherited)",
 					"\"Vendor\"",

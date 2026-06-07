@@ -14,7 +14,7 @@ flowchart LR
   API --> WorkOS["WorkOS AuthKit"]
   API --> OpenRouter["OpenRouter LLM"]
   API --> XAI["xAI realtime voice"]
-  iOS -. entitlement pending .-> FinanceKit["Apple FinanceKit"]
+  iOS --> FinanceKit["Apple FinanceKit"]
 ```
 
 ## Repository Layout
@@ -161,7 +161,14 @@ DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer \
   build
 ```
 
-Install after build:
+Install after build. Prefer the repository helper so the app is always installed from a fresh DerivedData product instead of a stale `ios/BudgetApp/build` artifact:
+
+```sh
+scripts/install-ios-build.sh simulator
+scripts/install-ios-build.sh device YOUR_DEVICE_ID
+```
+
+Manual install after build:
 
 ```sh
 DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer \
@@ -172,23 +179,22 @@ DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer \
 
 ## Implemented Product Areas
 
-- WorkOS sign-in flow with local session persistence.
+- WorkOS sign-in flow with local session persistence and targeted adoption of pre-auth local account data.
 - Plaid Link token creation and public-token exchange.
-- Plaid transaction sync and historical backfill path.
-- Convex-backed accounts, provider connections, encrypted Plaid item storage, transactions, observations, categories, budgets, goals, statements, receipts, and assistant conversations.
+- Plaid transaction sync with fast incremental refresh and explicit 12-month historical backfill.
+- Convex-backed accounts, provider connections, encrypted Plaid item storage, transactions, observations, categories, budgets, budget income overrides, goals, statements, receipts, and assistant conversations.
 - Activity tab with search/filter support and pull-to-refresh that triggers Plaid sync.
 - Cashflow tab with Health-style period selector, horizontally scrollable trend, selected-day details, and category drilldown.
-- Budgets tab with month navigation, income detection/review, budget category cards, category transaction assignment, budget editor, and Budget AI assistant.
+- Budgets tab with month navigation, synced income detection/review decisions, budget category cards, category transaction assignment, budget editor, and Budget AI proposal/review/apply assistant.
 - Finance assistant chat with conversations, streaming text responses, Markdown rendering, and xAI realtime voice plumbing.
 - Statement import for CSV and PDF upload path.
-- FinanceKit import surface and backend route.
+- FinanceKit import surface, native entitlement wiring, and backend route.
 
 ## Known Limitations / Next Work
 
-- FinanceKit requires Apple-managed entitlements. The code path exists, but real Apple Wallet/Apple Card import is blocked until the entitlement is granted and included in signing.
-- Budget income overrides are currently local iOS state; persist user include/exclude decisions in Convex before relying on multi-device behavior.
-- Budget AI is useful but should move from a single non-streaming call to a reviewed operation queue: proposed changes, diff, confirmation, then apply.
-- Plaid historical backfill is currently idempotent but may be heavier than necessary. Add a per-connection `historicalBackfilledAt` marker or explicit `backfill=true` trigger.
+- FinanceKit entitlement is configured in the app target, but each development/build machine still needs a refreshed provisioning profile that includes `com.apple.developer.financekit`.
+- Budget AI persists pending review plans and proposal history in Convex; next step is undo/reapply affordances and a clearer per-action diff before apply.
+- Plaid backfill is explicit from the Profile sync section; next step is richer per-item status and failed-item retry UI.
 - Receipt OCR and line-item classification need a full review/apply workflow.
 - Authorization is still mostly enforced by user key routing through the Go API. Harden API auth middleware before production.
 - Secrets are intentionally not in the repo. Keep `.env`, `.env.local`, bank statement samples, build artifacts, and derived data ignored.
@@ -198,7 +204,7 @@ DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer \
 Convex is the source of truth. Key relationships:
 
 - `users`: WorkOS or legacy user identity.
-- `connections`: provider connection, e.g. Plaid item or FinanceKit import source.
+- `connections`: provider connection, e.g. Plaid item or FinanceKit import source, including sync cursor and historical backfill marker.
 - `providerSecrets`: encrypted provider payloads such as Plaid access tokens.
 - `accounts`: normalized user-facing account records.
 - `providerAccounts`: provider-specific account identities linked to accounts.
@@ -206,8 +212,10 @@ Convex is the source of truth. Key relationships:
 - `transactionObservations`: raw provider observations used for dedupe/matching.
 - `transactionMatches`: links multiple provider observations to one normalized transaction.
 - `receipts` and `receiptLineItems`: receipt metadata and item-level categorization.
-- `categories`, `categoryRules`, `budgets`: budgeting and classification.
+- `categories`, `categoryRules`, `budgets`, `budgetIncomeOverrides`, `budgetAssistantProposals`: budgeting, classification, user-reviewed income detection, and pending AI budget plans.
 - `assistantConversations`, `assistantMessages`: persisted finance-chat threads.
+
+When a user signs into WorkOS after linking data locally, the iOS app sends the previous local `user_id` to the Go callback. The API calls `finance:legacyAdoptMissingUserData`, which moves only missing account/provider/transaction records into the WorkOS profile and skips account rows that already exist by source/type/subtype/name.
 
 ## Security Notes
 

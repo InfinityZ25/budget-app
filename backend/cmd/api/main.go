@@ -68,11 +68,12 @@ type account struct {
 	UpdatedAt         time.Time     `json:"updated_at"`
 }
 type plaidSyncItem struct {
-	UserID                string `json:"user_key"`
-	ItemID                string `json:"external_connection_id"`
-	DisplayName           string `json:"display_name"`
-	TransactionsCursor    string `json:"sync_cursor"`
-	AccessTokenCiphertext string `json:"encrypted_payload"`
+	UserID                 string `json:"user_key"`
+	ItemID                 string `json:"external_connection_id"`
+	DisplayName            string `json:"display_name"`
+	TransactionsCursor     string `json:"sync_cursor"`
+	HistoricalBackfilledAt int64  `json:"historical_backfilled_at"`
+	AccessTokenCiphertext  string `json:"encrypted_payload"`
 }
 type categorySplit struct {
 	CategoryID  string `json:"category_id"`
@@ -80,10 +81,11 @@ type categorySplit struct {
 	AmountCents int64  `json:"amount_cents"`
 }
 type receiptLineItem struct {
-	Name        string `json:"name"`
-	Quantity    string `json:"quantity,omitempty"`
-	AmountCents int64  `json:"amount_cents"`
-	CategoryID  string `json:"category_id,omitempty"`
+	Name         string `json:"name"`
+	Quantity     string `json:"quantity,omitempty"`
+	AmountCents  int64  `json:"amount_cents"`
+	CategoryID   string `json:"category_id,omitempty"`
+	CategoryName string `json:"category_name,omitempty"`
 }
 type transaction struct {
 	ID               string            `json:"id"`
@@ -137,6 +139,14 @@ type budget struct {
 	CreatedAt    time.Time `json:"created_at"`
 	UpdatedAt    time.Time `json:"updated_at"`
 }
+type budgetIncomeOverride struct {
+	ID            string    `json:"id"`
+	UserID        string    `json:"user_id"`
+	TransactionID string    `json:"transaction_id"`
+	Included      bool      `json:"included"`
+	CreatedAt     time.Time `json:"created_at"`
+	UpdatedAt     time.Time `json:"updated_at"`
+}
 type goal struct {
 	ID           string    `json:"id"`
 	UserID       string    `json:"user_id"`
@@ -174,6 +184,7 @@ type financeKitTransactionPayload struct {
 	MerchantName    string    `json:"merchant_name"`
 	AmountCents     int64     `json:"amount_cents"`
 	CurrencyCode    string    `json:"currency_code"`
+	AuthorizedAt    time.Time `json:"authorized_at"`
 	PostedAt        time.Time `json:"posted_at"`
 	Pending         bool      `json:"pending"`
 	LocationName    string    `json:"location_name"`
@@ -343,7 +354,7 @@ func (c *tokenCipher) decrypt(value string) (string, error) {
 }
 
 func (s *server) routes() *fiber.App {
-	app := fiber.New(fiber.Config{AppName: "Budget API"})
+	app := fiber.New(fiber.Config{AppName: "Budget API", BodyLimit: 25 * 1024 * 1024})
 	app.Get("/health", func(c *fiber.Ctx) error { return c.JSON(fiber.Map{"ok": true}) })
 	v1 := app.Group("/v1")
 	v1.Get("/accounts", s.listAccounts)
@@ -351,11 +362,15 @@ func (s *server) routes() *fiber.App {
 	v1.Get("/auth/workos/authorize-url", s.workOSAuthorizeURL)
 	v1.Post("/auth/workos/callback", s.workOSCallback)
 	v1.Post("/auth/workos/refresh", s.workOSRefresh)
+	v1.Post("/auth/workos/recover", s.workOSRecover)
 	v1.Post("/accounts/manual", s.createManualAccount)
 	v1.Delete("/accounts/:id", s.deleteAccount)
 	v1.Get("/transactions", s.listTransactions)
+	v1.Get("/transaction-signals", s.listTransactionSignals)
+	v1.Post("/transaction-signals/quick-add", s.createQuickTransactionSignal)
 	v1.Post("/transactions/manual", s.createManualTransaction)
 	v1.Patch("/transactions/:id/category", s.updateTransactionCategory)
+	v1.Put("/transactions/:id/receipt", s.upsertTransactionReceipt)
 	v1.Get("/statements", s.listStatements)
 	v1.Post("/statements", s.createStatement)
 	v1.Post("/statements/import-csv", s.importStatementCSV)
@@ -364,9 +379,18 @@ func (s *server) routes() *fiber.App {
 	v1.Post("/budgets", s.createBudget)
 	v1.Put("/budgets/:id", s.updateBudget)
 	v1.Delete("/budgets/:id", s.deleteBudget)
+	v1.Get("/budgets/income-overrides", s.listBudgetIncomeOverrides)
+	v1.Put("/budgets/income-overrides/:transaction_id", s.setBudgetIncomeOverride)
 	v1.Post("/budgets/autogenerate", s.autoBudgets)
+	v1.Get("/recurring-transactions", s.listRecurringTransactions)
+	v1.Post("/recurring-transactions/detect", s.detectRecurringTransactions)
+	v1.Put("/recurring-transactions/:id/status", s.updateRecurringTransactionStatus)
 	v1.Post("/budgets/assistant/chat", s.budgetAssistantChat)
 	v1.Post("/budgets/assistant/chat/stream", s.budgetAssistantChatStream)
+	v1.Post("/budgets/assistant/apply", s.budgetAssistantApply)
+	v1.Get("/budgets/assistant/proposals", s.listBudgetAssistantProposals)
+	v1.Get("/budgets/assistant/proposals/pending", s.pendingBudgetAssistantProposal)
+	v1.Delete("/budgets/assistant/proposals/:id", s.dismissBudgetAssistantProposal)
 	v1.Get("/goals", s.listGoals)
 	v1.Post("/goals", s.createGoal)
 	v1.Post("/cashflow/project", s.projectCashflow)
@@ -460,8 +484,9 @@ func (s *server) workOSCallback(c *fiber.Ctx) error {
 		return bad(c, errors.New("WORKOS_CLIENT_ID and WORKOS_API_KEY are required"))
 	}
 	var req struct {
-		Code         string `json:"code"`
-		CodeVerifier string `json:"code_verifier"`
+		Code              string `json:"code"`
+		CodeVerifier      string `json:"code_verifier"`
+		MigrateFromUserID string `json:"migrate_from_user_id"`
 	}
 	if err := c.BodyParser(&req); err != nil {
 		return bad(c, err)
@@ -483,6 +508,32 @@ func (s *server) workOSCallback(c *fiber.Ctx) error {
 	if err != nil {
 		return fail(c, err)
 	}
+	migrations := []fiber.Map{}
+	if req.MigrateFromUserID != "" && req.MigrateFromUserID != userID {
+		args := fiber.Map{"fromUserKey": req.MigrateFromUserID, "toUserKey": userID}
+		var migration fiber.Map
+		if err := s.convex.mutation(c.Context(), "finance:legacyAdoptMissingUserData", args, &migration); err != nil {
+			return fail(c, err)
+		}
+		migrations = append(migrations, migration)
+	}
+	email := strings.TrimSpace(strings.ToLower(authResp.User.Email))
+	if email != "" {
+		var owner struct {
+			Key      string `json:"key"`
+			Accounts int    `json:"accounts"`
+		}
+		if err := s.convex.query(c.Context(), "finance:legacyFindDataOwnerByEmail", fiber.Map{"email": email, "excludeUserKey": userID}, &owner); err != nil {
+			return fail(c, err)
+		}
+		if owner.Key != "" && owner.Key != userID && owner.Accounts > 0 {
+			var migration fiber.Map
+			if err := s.convex.mutation(c.Context(), "finance:legacyAdoptMissingUserData", fiber.Map{"fromUserKey": owner.Key, "toUserKey": userID}, &migration); err != nil {
+				return fail(c, err)
+			}
+			migrations = append(migrations, migration)
+		}
+	}
 	return c.JSON(fiber.Map{
 		"user_id":         userID,
 		"workos_user_id":  authResp.User.ID,
@@ -491,6 +542,7 @@ func (s *server) workOSCallback(c *fiber.Ctx) error {
 		"access_token":    authResp.AccessToken,
 		"refresh_token":   authResp.RefreshToken,
 		"organization_id": authResp.OrganizationID,
+		"migration":       aggregateMigrationSummaries(migrations),
 	})
 }
 
@@ -519,6 +571,33 @@ func (s *server) workOSRefresh(c *fiber.Ctx) error {
 	return c.JSON(fiber.Map{"access_token": authResp.AccessToken, "refresh_token": authResp.RefreshToken})
 }
 
+func (s *server) workOSRecover(c *fiber.Ctx) error {
+	var req struct {
+		UserID string `json:"user_id"`
+		Email  string `json:"email"`
+	}
+	if err := c.BodyParser(&req); err != nil {
+		return bad(c, err)
+	}
+	req.UserID = strings.TrimSpace(req.UserID)
+	req.Email = strings.TrimSpace(strings.ToLower(req.Email))
+	if req.UserID == "" {
+		return bad(c, errors.New("user_id is required"))
+	}
+	if req.Email == "" || strings.EqualFold(req.Email, "not signed in") {
+		return bad(c, errors.New("email is required for recovery"))
+	}
+	var accounts []map[string]any
+	if err := s.convex.query(c.Context(), "finance:legacyListAccounts", fiber.Map{"userKey": req.UserID}, &accounts); err != nil {
+		return fail(c, err)
+	}
+	migration, err := s.recoverUserDataByEmail(c.Context(), req.UserID, req.Email)
+	if err != nil {
+		return fail(c, err)
+	}
+	return c.JSON(fiber.Map{"migration": migration, "existing_accounts": len(accounts)})
+}
+
 func (s *server) upsertWorkOSUser(ctx context.Context, workOSUserID, email, name string) (string, error) {
 	if email == "" {
 		email = workOSUserID + "@workos.local"
@@ -532,6 +611,47 @@ func (s *server) upsertWorkOSUser(ctx context.Context, workOSUserID, email, name
 	return workOSUserID, nil
 }
 
+func (s *server) recoverUserDataByEmail(ctx context.Context, userID string, email string) (fiber.Map, error) {
+	var owner struct {
+		Key      string `json:"key"`
+		Accounts int    `json:"accounts"`
+	}
+	if err := s.convex.query(ctx, "finance:legacyFindDataOwnerByEmail", fiber.Map{"email": email, "excludeUserKey": userID}, &owner); err != nil {
+		return nil, err
+	}
+	if owner.Key == "" || owner.Key == userID || owner.Accounts == 0 {
+		return fiber.Map{"moved": 0, "moved_accounts": 0, "skipped_accounts": 0, "skipped": true}, nil
+	}
+	var migration fiber.Map
+	if err := s.convex.mutation(ctx, "finance:legacyAdoptMissingUserData", fiber.Map{"fromUserKey": owner.Key, "toUserKey": userID}, &migration); err != nil {
+		return nil, err
+	}
+	return migration, nil
+}
+
+func aggregateMigrationSummaries(migrations []fiber.Map) any {
+	if len(migrations) == 0 {
+		return nil
+	}
+	if len(migrations) == 1 {
+		return migrations[0]
+	}
+	totalMoved := 0
+	totalMovedAccounts := 0
+	totalSkippedAccounts := 0
+	for _, migration := range migrations {
+		totalMoved += intFromAny(migration["moved"])
+		totalMovedAccounts += intFromAny(migration["moved_accounts"])
+		totalSkippedAccounts += intFromAny(migration["skipped_accounts"])
+	}
+	return fiber.Map{
+		"moved":            totalMoved,
+		"moved_accounts":   totalMovedAccounts,
+		"skipped_accounts": totalSkippedAccounts,
+		"skipped":          totalMoved == 0 && totalMovedAccounts == 0,
+	}
+}
+
 func randomState() string {
 	bytes := make([]byte, 16)
 	if _, err := io.ReadFull(rand.Reader, bytes); err != nil {
@@ -541,9 +661,20 @@ func randomState() string {
 }
 
 func (s *server) listAccounts(c *fiber.Ctx) error {
+	userID := strings.TrimSpace(c.Query("user_id"))
 	var out []map[string]any
-	if err := s.convex.query(c.Context(), "finance:legacyListAccounts", fiber.Map{"userKey": c.Query("user_id")}, &out); err != nil {
+	if err := s.convex.query(c.Context(), "finance:legacyListAccounts", fiber.Map{"userKey": userID}, &out); err != nil {
 		return fail(c, err)
+	}
+	email := strings.TrimSpace(strings.ToLower(c.Query("email")))
+	if userID != "" && email != "" {
+		if migration, err := s.recoverUserDataByEmail(c.Context(), userID, email); err != nil {
+			return fail(c, err)
+		} else if intFromAny(migration["moved_accounts"]) > 0 {
+			if err := s.convex.query(c.Context(), "finance:legacyListAccounts", fiber.Map{"userKey": userID}, &out); err != nil {
+				return fail(c, err)
+			}
+		}
 	}
 	if out == nil {
 		out = []map[string]any{}
@@ -602,6 +733,106 @@ func (s *server) updateTransactionCategory(c *fiber.Ctx) error {
 	return c.JSON(tx)
 }
 
+func (s *server) upsertTransactionReceipt(c *fiber.Ctx) error {
+	var req struct {
+		UserID       string            `json:"user_id"`
+		MerchantName string            `json:"merchant_name"`
+		PurchasedAt  time.Time         `json:"purchased_at"`
+		TotalCents   int64             `json:"total_cents"`
+		CurrencyCode string            `json:"currency_code"`
+		LineItems    []receiptLineItem `json:"line_items"`
+	}
+	if err := c.BodyParser(&req); err != nil {
+		return bad(c, err)
+	}
+	if req.UserID == "" {
+		return bad(c, errors.New("user_id is required"))
+	}
+	lineItems := make([]fiber.Map, 0, len(req.LineItems))
+	for _, item := range req.LineItems {
+		lineItems = append(lineItems, fiber.Map{
+			"name":         item.Name,
+			"quantity":     item.Quantity,
+			"amountCents":  item.AmountCents,
+			"categoryName": item.CategoryName,
+		})
+	}
+	args := fiber.Map{
+		"userKey":       req.UserID,
+		"transactionId": c.Params("id"),
+		"merchantName":  req.MerchantName,
+		"totalCents":    req.TotalCents,
+		"currencyCode":  defaultString(req.CurrencyCode, "USD"),
+		"lineItems":     lineItems,
+	}
+	if !req.PurchasedAt.IsZero() {
+		args["purchasedAt"] = req.PurchasedAt.Format(time.RFC3339)
+	}
+	var tx map[string]any
+	if err := s.convex.mutation(c.Context(), "finance:legacyUpsertTransactionReceipt", args, &tx); err != nil {
+		return fail(c, err)
+	}
+	return c.JSON(tx)
+}
+
+func (s *server) listTransactionSignals(c *fiber.Ctx) error {
+	userID := c.Query("user_id")
+	if userID == "" {
+		return bad(c, errors.New("user_id is required"))
+	}
+	limit := c.QueryInt("limit", 50)
+	if limit <= 0 {
+		limit = 50
+	}
+	var signals []map[string]any
+	if err := s.convex.query(c.Context(), "finance:legacyListTransactionSignals", fiber.Map{"userKey": userID, "limit": limit}, &signals); err != nil {
+		return fail(c, err)
+	}
+	return c.JSON(signals)
+}
+
+func (s *server) createQuickTransactionSignal(c *fiber.Ctx) error {
+	var req struct {
+		UserID       string    `json:"user_id"`
+		AmountCents  *int64    `json:"amount_cents"`
+		MerchantHint string    `json:"merchant_hint"`
+		OccurredAt   time.Time `json:"occurred_at"`
+		LocationName string    `json:"location_name"`
+		Latitude     *float64  `json:"latitude"`
+		Longitude    *float64  `json:"longitude"`
+	}
+	if err := c.BodyParser(&req); err != nil {
+		return bad(c, err)
+	}
+	if req.UserID == "" {
+		return bad(c, errors.New("user_id is required"))
+	}
+	if req.OccurredAt.IsZero() {
+		req.OccurredAt = time.Now().UTC()
+	}
+	args := fiber.Map{"userKey": req.UserID, "occurredAt": req.OccurredAt.Format(time.RFC3339)}
+	if req.AmountCents != nil {
+		args["amountCents"] = *req.AmountCents
+	}
+	if strings.TrimSpace(req.MerchantHint) != "" {
+		args["merchantHint"] = strings.TrimSpace(req.MerchantHint)
+	}
+	if strings.TrimSpace(req.LocationName) != "" {
+		args["locationName"] = strings.TrimSpace(req.LocationName)
+	}
+	if req.Latitude != nil {
+		args["latitude"] = *req.Latitude
+	}
+	if req.Longitude != nil {
+		args["longitude"] = *req.Longitude
+	}
+	var signal map[string]any
+	if err := s.convex.mutation(c.Context(), "finance:legacyCreateQuickTransactionSignal", args, &signal); err != nil {
+		return fail(c, err)
+	}
+	return c.Status(201).JSON(signal)
+}
+
 func (s *server) importFinanceKit(c *fiber.Ctx) error {
 	var req financeKitImportRequest
 	if err := c.BodyParser(&req); err != nil {
@@ -610,33 +841,25 @@ func (s *server) importFinanceKit(c *fiber.Ctx) error {
 	if req.UserID == "" {
 		return bad(c, errors.New("user_id is required"))
 	}
-	var connectionID string
-	if err := s.convex.mutation(c.Context(), "finance:legacyUpsertConnection", fiber.Map{"userKey": req.UserID, "provider": "financeKit", "displayName": "Apple Wallet", "externalConnectionId": "apple-wallet"}, &connectionID); err != nil {
-		return fail(c, err)
-	}
-	accountIDs := map[string]bool{}
-	accountsImported := 0
+	log.Printf("financekit import start user=%s accounts=%d transactions=%d", req.UserID, len(req.Accounts), len(req.Transactions))
+	accounts := make([]fiber.Map, 0, len(req.Accounts))
+	accountIDs := map[string]struct{}{}
 	for _, payload := range req.Accounts {
 		if payload.ID == "" {
 			continue
 		}
 		name := defaultString(payload.Name, defaultString(payload.OfficialName, "Apple Wallet Account"))
 		currency := defaultString(payload.CurrencyCode, "USD")
-		var saved map[string]any
-		args := fiber.Map{"userKey": req.UserID, "connectionId": connectionID, "provider": "financeKit", "externalAccountId": payload.ID, "displayName": name, "officialName": defaultString(payload.OfficialName, payload.InstitutionName), "type": defaultString(payload.Type, "depository"), "subtype": payload.Subtype, "currencyCode": currency, "balanceCents": payload.BalanceCents, "creditLimitCents": payload.CreditLimitCents}
-		if err := s.convex.mutation(c.Context(), "finance:legacyUpsertProviderAccount", args, &saved); err != nil {
-			return fail(c, err)
-		}
-		accountIDs[payload.ID] = true
-		accountsImported++
+		accounts = append(accounts, fiber.Map{"externalAccountId": payload.ID, "displayName": name, "officialName": defaultString(payload.OfficialName, payload.InstitutionName), "type": defaultString(payload.Type, "depository"), "subtype": payload.Subtype, "currencyCode": currency, "balanceCents": payload.BalanceCents, "creditLimitCents": payload.CreditLimitCents})
+		accountIDs[payload.ID] = struct{}{}
 	}
 
-	transactionsImported := 0
+	transactions := make([]fiber.Map, 0, len(req.Transactions))
 	for _, payload := range req.Transactions {
 		if payload.ID == "" || payload.AccountID == "" {
 			continue
 		}
-		if !accountIDs[payload.AccountID] {
+		if _, ok := accountIDs[payload.AccountID]; !ok {
 			continue
 		}
 		postedAt := payload.PostedAt
@@ -644,14 +867,24 @@ func (s *server) importFinanceKit(c *fiber.Ctx) error {
 			postedAt = time.Now().UTC()
 		}
 		externalID := "financekit:" + payload.ID
-		var saved map[string]any
-		args := fiber.Map{"userKey": req.UserID, "provider": "financeKit", "externalAccountId": payload.AccountID, "externalTransactionId": externalID, "description": defaultString(payload.Description, "Apple Wallet transaction"), "merchantName": payload.MerchantName, "amountCents": payload.AmountCents, "currencyCode": defaultString(payload.CurrencyCode, "USD"), "postedAt": postedAt.Format(time.RFC3339), "pending": payload.Pending, "locationName": payload.LocationName, "raw": payload}
-		if err := s.convex.mutation(c.Context(), "finance:legacyUpsertProviderTransaction", args, &saved); err != nil {
-			return fail(c, err)
+		transaction := fiber.Map{"externalAccountId": payload.AccountID, "externalTransactionId": externalID, "description": defaultString(payload.Description, "Apple Wallet transaction"), "merchantName": payload.MerchantName, "amountCents": payload.AmountCents, "currencyCode": defaultString(payload.CurrencyCode, "USD"), "postedAt": postedAt.Format(time.RFC3339), "pending": payload.Pending, "locationName": payload.LocationName, "raw": payload}
+		if !payload.AuthorizedAt.IsZero() {
+			transaction["authorizedAt"] = payload.AuthorizedAt.Format(time.RFC3339)
 		}
-		transactionsImported++
+		transactions = append(transactions, transaction)
 	}
-	return c.JSON(fiber.Map{"accounts": accountsImported, "transactions": transactionsImported})
+
+	var out struct {
+		Accounts     int `json:"accounts"`
+		Transactions int `json:"transactions"`
+	}
+	args := fiber.Map{"userKey": req.UserID, "provider": "financeKit", "displayName": "Apple Wallet", "externalConnectionId": "apple-wallet", "accounts": accounts, "transactions": transactions}
+	if err := s.convex.mutation(c.Context(), "finance:legacyImportProviderSnapshot", args, &out); err != nil {
+		log.Printf("financekit import failed user=%s accounts=%d transactions=%d error=%v", req.UserID, len(accounts), len(transactions), err)
+		return fail(c, err)
+	}
+	log.Printf("financekit import complete user=%s accounts=%d transactions=%d", req.UserID, out.Accounts, out.Transactions)
+	return c.JSON(out)
 }
 
 func (s *server) createStatement(c *fiber.Ctx) error {
@@ -803,7 +1036,11 @@ func (s *server) listTransactions(c *fiber.Ctx) error {
 	if limit <= 0 || limit > 1000 {
 		limit = 100
 	}
-	args := fiber.Map{"userKey": c.Query("user_id"), "limit": int(limit), "sort": c.Query("sort"), "direction": c.Query("direction")}
+	offset, _ := strconv.ParseInt(c.Query("offset", "0"), 10, 64)
+	if offset < 0 {
+		offset = 0
+	}
+	args := fiber.Map{"userKey": c.Query("user_id"), "limit": int(limit), "offset": int(offset), "sort": c.Query("sort"), "direction": c.Query("direction")}
 	if query := strings.TrimSpace(c.Query("q")); query != "" {
 		args["q"] = query
 	}
@@ -821,6 +1058,12 @@ func (s *server) listTransactions(c *fiber.Ctx) error {
 	}
 	if amount := centsFromQuery(c.Query("amount_lt")); amount != nil {
 		args["amountLt"] = *amount
+	}
+	if postedFrom := millisFromQueryDate(c.Query("posted_from"), false); postedFrom != nil {
+		args["postedFrom"] = *postedFrom
+	}
+	if postedTo := millisFromQueryDate(c.Query("posted_to"), true); postedTo != nil {
+		args["postedTo"] = *postedTo
 	}
 	var out []map[string]any
 	if err := s.convex.query(c.Context(), "finance:legacyListTransactions", args, &out); err != nil {
@@ -843,6 +1086,25 @@ func centsFromQuery(value string) *int64 {
 	}
 	cents := int64(math.Round(amount * 100))
 	return &cents
+}
+
+func millisFromQueryDate(value string, endOfDay bool) *float64 {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return nil
+	}
+	parsed, err := time.Parse("2006-01-02", value)
+	if err != nil {
+		parsed, err = time.Parse(time.RFC3339, value)
+		if err != nil {
+			return nil
+		}
+	}
+	if endOfDay {
+		parsed = parsed.Add(24*time.Hour - time.Millisecond)
+	}
+	millis := float64(parsed.UTC().UnixMilli())
+	return &millis
 }
 
 func (s *server) createBudget(c *fiber.Ctx) error {
@@ -889,6 +1151,37 @@ func (s *server) listBudgets(c *fiber.Ctx) error {
 	}
 	return c.JSON(out)
 }
+func (s *server) listBudgetIncomeOverrides(c *fiber.Ctx) error {
+	var out []budgetIncomeOverride
+	if err := s.convex.query(c.Context(), "finance:legacyListBudgetIncomeOverrides", fiber.Map{"userKey": c.Query("user_id")}, &out); err != nil {
+		return fail(c, err)
+	}
+	if out == nil {
+		out = []budgetIncomeOverride{}
+	}
+	return c.JSON(out)
+}
+func (s *server) setBudgetIncomeOverride(c *fiber.Ctx) error {
+	var req struct {
+		UserID   string `json:"user_id"`
+		Included bool   `json:"included"`
+	}
+	if err := c.BodyParser(&req); err != nil {
+		return bad(c, err)
+	}
+	if req.UserID == "" {
+		return bad(c, errors.New("user_id is required"))
+	}
+	transactionID := strings.TrimSpace(c.Params("transaction_id"))
+	if transactionID == "" {
+		return bad(c, errors.New("transaction_id is required"))
+	}
+	var out budgetIncomeOverride
+	if err := s.convex.mutation(c.Context(), "finance:legacySetBudgetIncomeOverride", fiber.Map{"userKey": req.UserID, "transactionId": transactionID, "included": req.Included}, &out); err != nil {
+		return fail(c, err)
+	}
+	return c.JSON(out)
+}
 func (s *server) autoBudgets(c *fiber.Ctx) error {
 	var req struct {
 		UserID string `json:"user_id"`
@@ -906,9 +1199,81 @@ func (s *server) autoBudgets(c *fiber.Ctx) error {
 	return c.JSON(out)
 }
 
+func (s *server) listRecurringTransactions(c *fiber.Ctx) error {
+	args := fiber.Map{"userKey": c.Query("user_id")}
+	if kind := strings.TrimSpace(c.Query("kind")); kind != "" {
+		args["kind"] = kind
+	}
+	var out []map[string]any
+	if err := s.convex.query(c.Context(), "finance:legacyListRecurringTransactions", args, &out); err != nil {
+		return fail(c, err)
+	}
+	if out == nil {
+		out = []map[string]any{}
+	}
+	return c.JSON(out)
+}
+
+func (s *server) detectRecurringTransactions(c *fiber.Ctx) error {
+	var req struct {
+		UserID       string `json:"user_id"`
+		LookbackDays int    `json:"lookback_days"`
+	}
+	if err := c.BodyParser(&req); err != nil {
+		return bad(c, err)
+	}
+	if req.LookbackDays <= 0 {
+		req.LookbackDays = 365
+	}
+	var out []map[string]any
+	if err := s.convex.mutation(c.Context(), "finance:legacyDetectRecurringTransactions", fiber.Map{"userKey": req.UserID, "lookbackDays": req.LookbackDays}, &out); err != nil {
+		return fail(c, err)
+	}
+	if out == nil {
+		out = []map[string]any{}
+	}
+	return c.JSON(out)
+}
+
+func (s *server) updateRecurringTransactionStatus(c *fiber.Ctx) error {
+	var req struct {
+		UserID string `json:"user_id"`
+		Status string `json:"status"`
+	}
+	if err := c.BodyParser(&req); err != nil {
+		return bad(c, err)
+	}
+	req.Status = strings.TrimSpace(strings.ToLower(req.Status))
+	if req.Status != "suggested" && req.Status != "confirmed" && req.Status != "ignored" {
+		return bad(c, errors.New("status must be suggested, confirmed, or ignored"))
+	}
+	var out map[string]any
+	if err := s.convex.mutation(c.Context(), "finance:legacyUpdateRecurringTransactionStatus", fiber.Map{"userKey": req.UserID, "recurringId": c.Params("id"), "status": req.Status}, &out); err != nil {
+		return fail(c, err)
+	}
+	return c.JSON(out)
+}
+
 type budgetAssistantRequest struct {
 	UserID  string `json:"user_id"`
 	Message string `json:"message"`
+}
+
+type budgetAssistantApplyRequest struct {
+	UserID     string              `json:"user_id"`
+	ProposalID string              `json:"proposal_id,omitempty"`
+	Plan       budgetAssistantPlan `json:"plan"`
+}
+
+type budgetAssistantProposal struct {
+	ID        string    `json:"id"`
+	UserID    string    `json:"user_id"`
+	Prompt    string    `json:"prompt"`
+	Reply     string    `json:"reply"`
+	PlanJSON  string    `json:"plan_json"`
+	Status    string    `json:"status"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
 }
 
 type budgetAssistantPlan struct {
@@ -952,7 +1317,8 @@ func (s *server) budgetAssistantChat(c *fiber.Ctx) error {
 	if err != nil {
 		plan = fallbackBudgetAssistantPlan(req.Message, budgets, transactions)
 	}
-	result := s.applyBudgetAssistantPlan(c.Context(), req.UserID, plan, budgets)
+	result := s.proposeBudgetAssistantPlan(plan)
+	proposalID := s.createBudgetAssistantProposal(c.Context(), req.UserID, req.Message, plan, result)
 	return c.JSON(fiber.Map{
 		"reply":           result.Reply,
 		"created_budgets": result.CreatedBudgets,
@@ -961,6 +1327,97 @@ func (s *server) budgetAssistantChat(c *fiber.Ctx) error {
 		"classified":      result.Classified,
 		"needs_review":    result.NeedsReview,
 		"follow_ups":      result.FollowUps,
+		"plan":            plan,
+		"proposal_id":     proposalID,
+		"mode":            "proposal",
+		"created_at":      time.Now().UTC(),
+	})
+}
+
+func (s *server) pendingBudgetAssistantProposal(c *fiber.Ctx) error {
+	userID := strings.TrimSpace(c.Query("user_id"))
+	if userID == "" {
+		return bad(c, errors.New("user_id is required"))
+	}
+	var proposal *budgetAssistantProposal
+	if err := s.convex.query(c.Context(), "finance:legacyLatestPendingBudgetAssistantProposal", fiber.Map{"userKey": userID}, &proposal); err != nil {
+		return fail(c, err)
+	}
+	if proposal == nil || proposal.ID == "" {
+		return c.JSON(fiber.Map{"proposal": nil})
+	}
+	plan, err := decodeBudgetAssistantPlan(proposal.PlanJSON)
+	if err != nil {
+		return fail(c, err)
+	}
+	result := s.proposeBudgetAssistantPlan(plan)
+	result.Reply = defaultString(proposal.Reply, result.Reply)
+	return c.JSON(fiber.Map{"proposal": budgetAssistantReplyPayload(result, plan, proposal.ID, proposal.Status, proposal.CreatedAt)})
+}
+
+func (s *server) listBudgetAssistantProposals(c *fiber.Ctx) error {
+	userID := strings.TrimSpace(c.Query("user_id"))
+	if userID == "" {
+		return bad(c, errors.New("user_id is required"))
+	}
+	limit := 25
+	if parsed, err := strconv.Atoi(c.Query("limit")); err == nil && parsed > 0 {
+		limit = min(parsed, 100)
+	}
+	var proposals []budgetAssistantProposal
+	if err := s.convex.query(c.Context(), "finance:legacyListBudgetAssistantProposals", fiber.Map{"userKey": userID, "limit": limit}, &proposals); err != nil {
+		return fail(c, err)
+	}
+	out := make([]fiber.Map, 0, len(proposals))
+	for _, proposal := range proposals {
+		plan, err := decodeBudgetAssistantPlan(proposal.PlanJSON)
+		if err != nil {
+			continue
+		}
+		result := s.proposeBudgetAssistantPlan(plan)
+		result.Reply = defaultString(proposal.Reply, result.Reply)
+		out = append(out, budgetAssistantReplyPayload(result, plan, proposal.ID, proposal.Status, proposal.CreatedAt))
+	}
+	return c.JSON(out)
+}
+
+func (s *server) dismissBudgetAssistantProposal(c *fiber.Ctx) error {
+	userID := strings.TrimSpace(c.Query("user_id"))
+	if userID == "" {
+		return bad(c, errors.New("user_id is required"))
+	}
+	var out budgetAssistantProposal
+	if err := s.convex.mutation(c.Context(), "finance:legacyUpdateBudgetAssistantProposalStatus", fiber.Map{"userKey": userID, "proposalId": c.Params("id"), "status": "dismissed"}, &out); err != nil {
+		return fail(c, err)
+	}
+	return c.JSON(fiber.Map{"dismissed": true})
+}
+
+func (s *server) budgetAssistantApply(c *fiber.Ctx) error {
+	var req budgetAssistantApplyRequest
+	if err := c.BodyParser(&req); err != nil {
+		return bad(c, err)
+	}
+	if req.UserID == "" {
+		return bad(c, errors.New("user_id is required"))
+	}
+	var budgets []map[string]any
+	_ = s.convex.query(c.Context(), "finance:legacyListBudgets", fiber.Map{"userKey": req.UserID}, &budgets)
+	result := s.applyBudgetAssistantPlan(c.Context(), req.UserID, req.Plan, budgets)
+	if strings.TrimSpace(req.ProposalID) != "" {
+		s.updateBudgetAssistantProposalStatus(c.Context(), req.UserID, req.ProposalID, "applied")
+	}
+	return c.JSON(fiber.Map{
+		"reply":           result.Reply,
+		"created_budgets": result.CreatedBudgets,
+		"updated_budgets": result.UpdatedBudgets,
+		"deleted_budgets": result.DeletedBudgets,
+		"classified":      result.Classified,
+		"needs_review":    result.NeedsReview,
+		"follow_ups":      result.FollowUps,
+		"plan":            req.Plan,
+		"proposal_id":     req.ProposalID,
+		"mode":            "applied",
 		"created_at":      time.Now().UTC(),
 	})
 }
@@ -1003,9 +1460,10 @@ func (s *server) budgetAssistantChatStream(c *fiber.Ctx) error {
 			_ = w.Flush()
 		}
 
-		sendSSE(w, "status", fiber.Map{"message": "Applying high-confidence updates…"})
+		sendSSE(w, "status", fiber.Map{"message": "Preparing a reviewable plan…"})
 		_ = w.Flush()
-		result := s.applyBudgetAssistantPlan(ctx, req.UserID, plan, budgets)
+		result := s.proposeBudgetAssistantPlan(plan)
+		proposalID := s.createBudgetAssistantProposal(ctx, req.UserID, req.Message, plan, result)
 		reply := budgetAssistantResponseText(result)
 		for _, token := range chunkText(reply, 18) {
 			sendSSE(w, "token", fiber.Map{"delta": token})
@@ -1020,6 +1478,9 @@ func (s *server) budgetAssistantChatStream(c *fiber.Ctx) error {
 			"classified":      result.Classified,
 			"needs_review":    result.NeedsReview,
 			"follow_ups":      result.FollowUps,
+			"plan":            plan,
+			"proposal_id":     proposalID,
+			"mode":            "proposal",
 			"created_at":      time.Now().UTC(),
 		})
 		_ = w.Flush()
@@ -1035,6 +1496,89 @@ type budgetAssistantResult struct {
 	Classified     int      `json:"classified"`
 	NeedsReview    int      `json:"needs_review"`
 	FollowUps      []string `json:"follow_ups"`
+}
+
+func budgetAssistantReplyPayload(result budgetAssistantResult, plan budgetAssistantPlan, proposalID string, mode string, createdAt time.Time) fiber.Map {
+	return fiber.Map{
+		"reply":           result.Reply,
+		"created_budgets": result.CreatedBudgets,
+		"updated_budgets": result.UpdatedBudgets,
+		"deleted_budgets": result.DeletedBudgets,
+		"classified":      result.Classified,
+		"needs_review":    result.NeedsReview,
+		"follow_ups":      result.FollowUps,
+		"plan":            plan,
+		"proposal_id":     proposalID,
+		"mode":            mode,
+		"created_at":      createdAt,
+	}
+}
+
+func (s *server) createBudgetAssistantProposal(ctx context.Context, userID string, prompt string, plan budgetAssistantPlan, result budgetAssistantResult) string {
+	planJSON, err := json.Marshal(plan)
+	if err != nil {
+		return ""
+	}
+	var proposal budgetAssistantProposal
+	err = s.convex.mutation(ctx, "finance:legacyCreateBudgetAssistantProposal", fiber.Map{
+		"userKey":  userID,
+		"prompt":   prompt,
+		"reply":    result.Reply,
+		"planJson": string(planJSON),
+	}, &proposal)
+	if err != nil {
+		return ""
+	}
+	return proposal.ID
+}
+
+func (s *server) updateBudgetAssistantProposalStatus(ctx context.Context, userID string, proposalID string, status string) {
+	var out budgetAssistantProposal
+	_ = s.convex.mutation(ctx, "finance:legacyUpdateBudgetAssistantProposalStatus", fiber.Map{"userKey": userID, "proposalId": proposalID, "status": status}, &out)
+}
+
+func decodeBudgetAssistantPlan(value string) (budgetAssistantPlan, error) {
+	var plan budgetAssistantPlan
+	if err := json.Unmarshal([]byte(value), &plan); err != nil {
+		return budgetAssistantPlan{}, err
+	}
+	return plan, nil
+}
+
+func (s *server) proposeBudgetAssistantPlan(plan budgetAssistantPlan) budgetAssistantResult {
+	result := budgetAssistantResult{Reply: strings.TrimSpace(plan.Reply), FollowUps: plan.FollowUps}
+	if result.Reply == "" {
+		result.Reply = "I prepared budget changes for your review."
+	}
+	for _, action := range plan.Budgets {
+		categoryName := strings.TrimSpace(action.CategoryName)
+		if categoryName == "" {
+			continue
+		}
+		operation := strings.ToLower(strings.TrimSpace(action.Operation))
+		switch operation {
+		case "delete", "remove":
+			result.DeletedBudgets++
+		case "update":
+			result.UpdatedBudgets++
+		default:
+			result.CreatedBudgets++
+		}
+	}
+	for _, classification := range plan.Classifications {
+		if strings.TrimSpace(classification.TransactionID) == "" || strings.TrimSpace(classification.CategoryName) == "" {
+			continue
+		}
+		if classification.Confidence >= 0.72 {
+			result.Classified++
+		} else {
+			result.NeedsReview++
+		}
+	}
+	if result.CreatedBudgets+result.UpdatedBudgets+result.DeletedBudgets+result.Classified == 0 && len(result.FollowUps) == 0 {
+		result.FollowUps = []string{"I did not find any safe budget edits to propose. Give me category names and amounts, or ask me to classify specific merchants."}
+	}
+	return result
 }
 
 func (s *server) applyBudgetAssistantPlan(ctx context.Context, userID string, plan budgetAssistantPlan, existingBudgets []map[string]any) budgetAssistantResult {
@@ -1957,6 +2501,8 @@ type plaidSyncTransaction struct {
 	Amount                  float64 `json:"amount"`
 	IsoCurrencyCode         string  `json:"iso_currency_code"`
 	Date                    string  `json:"date"`
+	AuthorizedDate          string  `json:"authorized_date"`
+	AuthorizedDatetime      string  `json:"authorized_datetime"`
 	Pending                 bool    `json:"pending"`
 	PersonalFinanceCategory struct {
 		Primary    string `json:"primary"`
@@ -2019,7 +2565,7 @@ func (s *server) exchangePublicToken(c *fiber.Ctx) error {
 		createdAccounts = append(createdAccounts, acc)
 	}
 	item := plaidSyncItem{UserID: req.UserID, ItemID: exchange.ItemID, DisplayName: displayName, AccessTokenCiphertext: encrypted}
-	syncResult, err := s.syncPlaidAccessToken(c.Context(), item, exchange.AccessToken)
+	syncResult, err := s.syncPlaidAccessToken(c.Context(), item, exchange.AccessToken, 12)
 	if err != nil {
 		return fail(c, err)
 	}
@@ -2028,7 +2574,9 @@ func (s *server) exchangePublicToken(c *fiber.Ctx) error {
 
 func (s *server) syncPlaidItems(c *fiber.Ctx) error {
 	var req struct {
-		UserID string `json:"user_id"`
+		UserID         string `json:"user_id"`
+		Backfill       bool   `json:"backfill"`
+		BackfillMonths int    `json:"backfill_months"`
 	}
 	if err := c.BodyParser(&req); err != nil {
 		return bad(c, err)
@@ -2038,6 +2586,12 @@ func (s *server) syncPlaidItems(c *fiber.Ctx) error {
 	}
 	if req.UserID == "" {
 		return bad(c, errors.New("user_id is required"))
+	}
+	if c.Query("backfill") == "true" || c.Query("backfill") == "1" {
+		req.Backfill = true
+	}
+	if req.BackfillMonths <= 0 {
+		req.BackfillMonths = intFromAny(c.Query("backfill_months"))
 	}
 	var items []plaidSyncItem
 	if err := s.convex.query(c.Context(), "finance:legacyListPlaidConnections", fiber.Map{"userKey": req.UserID}, &items); err != nil {
@@ -2054,7 +2608,14 @@ func (s *server) syncPlaidItems(c *fiber.Ctx) error {
 		if err != nil {
 			return fail(c, err)
 		}
-		result, err := s.syncPlaidAccessToken(c.Context(), item, accessToken)
+		backfillMonths := 0
+		if req.Backfill {
+			backfillMonths = req.BackfillMonths
+			if backfillMonths <= 0 {
+				backfillMonths = 12
+			}
+		}
+		result, err := s.syncPlaidAccessToken(c.Context(), item, accessToken, backfillMonths)
 		if err != nil {
 			return fail(c, err)
 		}
@@ -2065,23 +2626,31 @@ func (s *server) syncPlaidItems(c *fiber.Ctx) error {
 		result["item_id"] = item.ItemID
 		results = append(results, result)
 	}
-	return c.JSON(fiber.Map{"items": len(items), "added": totalAdded, "modified": totalModified, "removed": totalRemoved, "backfilled": totalBackfilled, "results": results})
+	return c.JSON(fiber.Map{"items": len(items), "added": totalAdded, "modified": totalModified, "removed": totalRemoved, "backfilled": totalBackfilled, "backfill_requested": req.Backfill, "results": results})
 }
 
 func (s *server) syncPlaidItem(c *fiber.Ctx) error {
 	userID := c.Query("user_id")
 	itemID := c.Params("id")
-	syncResult, err := s.syncPlaidItemByID(c.Context(), userID, itemID)
+	backfillMonths := 0
+	if c.Query("backfill") == "true" || c.Query("backfill") == "1" {
+		backfillMonths = intFromAny(c.Query("backfill_months"))
+		if backfillMonths <= 0 {
+			backfillMonths = 12
+		}
+	}
+	syncResult, err := s.syncPlaidItemByID(c.Context(), userID, itemID, backfillMonths)
 	if err != nil {
 		return fail(c, err)
 	}
 	return c.JSON(syncResult)
 }
 
-func (s *server) syncPlaidItemByID(ctx context.Context, userID string, itemID string) (fiber.Map, error) {
+func (s *server) syncPlaidItemByID(ctx context.Context, userID string, itemID string, backfillMonths int) (fiber.Map, error) {
 	var secret struct {
-		SyncCursor       string `json:"syncCursor"`
-		EncryptedPayload string `json:"encryptedPayload"`
+		SyncCursor             string `json:"syncCursor"`
+		HistoricalBackfilledAt int64  `json:"historical_backfilled_at"`
+		EncryptedPayload       string `json:"encryptedPayload"`
 	}
 	if err := s.convex.query(ctx, "finance:legacyGetConnectionSecret", fiber.Map{"userKey": userID, "provider": "plaid", "externalConnectionId": itemID}, &secret); err != nil {
 		return nil, err
@@ -2090,8 +2659,8 @@ func (s *server) syncPlaidItemByID(ctx context.Context, userID string, itemID st
 	if err != nil {
 		return nil, err
 	}
-	item := plaidSyncItem{UserID: userID, ItemID: itemID, TransactionsCursor: secret.SyncCursor, AccessTokenCiphertext: secret.EncryptedPayload}
-	return s.syncPlaidAccessToken(ctx, item, accessToken)
+	item := plaidSyncItem{UserID: userID, ItemID: itemID, TransactionsCursor: secret.SyncCursor, HistoricalBackfilledAt: secret.HistoricalBackfilledAt, AccessTokenCiphertext: secret.EncryptedPayload}
+	return s.syncPlaidAccessToken(ctx, item, accessToken, backfillMonths)
 }
 
 func (s *server) plaidWebhook(c *fiber.Ctx) error {
@@ -2122,7 +2691,7 @@ func (s *server) plaidWebhook(c *fiber.Ctx) error {
 			log.Printf("plaid webhook decrypt failed item_id=%s err=%v", req.ItemID, err)
 			return
 		}
-		result, err := s.syncPlaidAccessToken(ctx, item, accessToken)
+		result, err := s.syncPlaidAccessToken(ctx, item, accessToken, 0)
 		if err != nil {
 			log.Printf("plaid webhook sync failed item_id=%s code=%s err=%v", req.ItemID, req.WebhookCode, err)
 			return
@@ -2132,7 +2701,7 @@ func (s *server) plaidWebhook(c *fiber.Ctx) error {
 	return c.JSON(fiber.Map{"ok": true, "queued": true, "item_id": req.ItemID, "webhook_code": req.WebhookCode})
 }
 
-func (s *server) syncPlaidAccessToken(ctx context.Context, item plaidSyncItem, accessToken string) (fiber.Map, error) {
+func (s *server) syncPlaidAccessToken(ctx context.Context, item plaidSyncItem, accessToken string, backfillMonths int) (fiber.Map, error) {
 	request := map[string]any{"client_id": s.plaid.clientID, "secret": s.plaid.secret, "access_token": accessToken, "options": map[string]any{"include_personal_finance_category": true}}
 	if item.TransactionsCursor != "" {
 		request["cursor"] = item.TransactionsCursor
@@ -2173,12 +2742,21 @@ func (s *server) syncPlaidAccessToken(ctx context.Context, item plaidSyncItem, a
 		}
 		request["cursor"] = syncResponse.NextCursor
 	}
-	_ = s.convex.mutation(ctx, "finance:legacyUpdateConnectionCursor", fiber.Map{"userKey": item.UserID, "provider": "plaid", "externalConnectionId": item.ItemID, "syncCursor": item.TransactionsCursor}, nil)
-	backfilled, err := s.backfillPlaidTransactions(ctx, item.UserID, accessToken, 12)
-	if err != nil {
-		return fiber.Map{"added": added, "modified": modified, "removed": removed, "backfilled": backfilled, "backfill_error": err.Error(), "next_cursor": item.TransactionsCursor}, nil
+	updateArgs := fiber.Map{"userKey": item.UserID, "provider": "plaid", "externalConnectionId": item.ItemID, "syncCursor": item.TransactionsCursor}
+	backfilled := 0
+	var backfillErr error
+	if backfillMonths > 0 {
+		backfilled, backfillErr = s.backfillPlaidTransactions(ctx, item.UserID, accessToken, backfillMonths)
+		if backfillErr == nil {
+			updateArgs["historicalBackfilledAt"] = time.Now().UTC().UnixMilli()
+		}
 	}
-	return fiber.Map{"added": added, "modified": modified, "removed": removed, "backfilled": backfilled, "next_cursor": item.TransactionsCursor}, nil
+	_ = s.convex.mutation(ctx, "finance:legacyUpdateConnectionCursor", updateArgs, nil)
+	result := fiber.Map{"added": added, "modified": modified, "removed": removed, "backfilled": backfilled, "backfill_requested": backfillMonths > 0, "next_cursor": item.TransactionsCursor}
+	if backfillErr != nil {
+		result["backfill_error"] = backfillErr.Error()
+	}
+	return result, nil
 }
 
 func (s *server) backfillPlaidTransactions(ctx context.Context, userID string, accessToken string, months int) (int, error) {
@@ -2223,6 +2801,7 @@ func (s *server) backfillPlaidTransactions(ctx context.Context, userID string, a
 
 func (s *server) upsertPlaidTransaction(ctx context.Context, userID string, plaidTransaction plaidSyncTransaction) error {
 	postedAt, _ := time.Parse("2006-01-02", plaidTransaction.Date)
+	authorizedAt := plaidAuthorizedAt(plaidTransaction)
 	location := plaidTransaction.Location.City
 	if plaidTransaction.Location.Region != "" {
 		location += ", " + plaidTransaction.Location.Region
@@ -2238,7 +2817,26 @@ func (s *server) upsertPlaidTransaction(ctx context.Context, userID string, plai
 	}
 	var out map[string]any
 	args := fiber.Map{"userKey": userID, "provider": "plaid", "externalAccountId": plaidTransaction.AccountID, "externalTransactionId": plaidTransaction.TransactionID, "description": plaidTransaction.Name, "merchantName": plaidTransaction.MerchantName, "amountCents": amountCents, "currencyCode": defaultString(plaidTransaction.IsoCurrencyCode, "USD"), "postedAt": postedAt.Format(time.RFC3339), "pending": plaidTransaction.Pending, "locationName": location, "categorySplits": categorySplits, "raw": plaidTransaction}
+	if !authorizedAt.IsZero() {
+		args["authorizedAt"] = authorizedAt.Format(time.RFC3339)
+	}
 	return s.convex.mutation(ctx, "finance:legacyUpsertProviderTransaction", args, &out)
+}
+
+func plaidAuthorizedAt(tx plaidSyncTransaction) time.Time {
+	if tx.AuthorizedDatetime != "" {
+		for _, layout := range []string{time.RFC3339Nano, time.RFC3339, "2006-01-02T15:04:05Z07:00"} {
+			if parsed, err := time.Parse(layout, tx.AuthorizedDatetime); err == nil {
+				return parsed.UTC()
+			}
+		}
+	}
+	if tx.AuthorizedDate != "" {
+		if parsed, err := time.Parse("2006-01-02", tx.AuthorizedDate); err == nil {
+			return parsed.UTC()
+		}
+	}
+	return time.Time{}
 }
 
 func plaidCategoryName(tx plaidSyncTransaction) string {
@@ -2283,6 +2881,9 @@ func intFromAny(value any) int {
 	case json.Number:
 		n, _ := typed.Int64()
 		return int(n)
+	case string:
+		n, _ := strconv.Atoi(strings.TrimSpace(typed))
+		return n
 	default:
 		return 0
 	}

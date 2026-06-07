@@ -27,6 +27,14 @@ const matchStatus = v.union(
   v.literal("rejected"),
 );
 
+const transactionSignalSource = v.union(
+  v.literal("plaid_first_seen"),
+  v.literal("financekit_transaction_date"),
+  v.literal("quick_add"),
+  v.literal("receipt"),
+  v.literal("email_alert"),
+);
+
 const categorySplit = v.object({
   categoryId: v.optional(v.id("categories")),
   name: v.string(),
@@ -44,7 +52,8 @@ export default defineSchema({
     updatedAt: v.number(),
   })
     .index("by_workos_user_id", ["workosUserId"])
-    .index("by_token", ["tokenIdentifier"]),
+    .index("by_token", ["tokenIdentifier"])
+    .index("by_email", ["email"]),
 
   connections: defineTable({
     userId: v.id("users"),
@@ -54,6 +63,7 @@ export default defineSchema({
     externalConnectionId: v.optional(v.string()),
     lastSyncedAt: v.optional(v.number()),
     syncCursor: v.optional(v.string()),
+    historicalBackfilledAt: v.optional(v.number()),
     createdAt: v.number(),
     updatedAt: v.number(),
   })
@@ -132,6 +142,7 @@ export default defineSchema({
     createdAt: v.number(),
     updatedAt: v.number(),
   })
+    .index("by_user", ["userId"])
     .index("by_user_posted_at", ["userId", "postedAt"])
     .index("by_user_account_posted_at", ["userId", "accountId", "postedAt"])
     .index("by_user_amount", ["userId", "amountCents"])
@@ -177,6 +188,27 @@ export default defineSchema({
     .index("by_user", ["userId"])
     .index("by_transaction", ["transactionId"])
     .index("by_status", ["userId", "status"]),
+
+  transactionSignals: defineTable({
+    userId: v.id("users"),
+    source: transactionSignalSource,
+    amountCents: v.optional(v.int64()),
+    merchantHint: v.optional(v.string()),
+    occurredAt: v.number(),
+    locationName: v.optional(v.string()),
+    latitude: v.optional(v.number()),
+    longitude: v.optional(v.number()),
+    matchedTransactionId: v.optional(v.id("transactions")),
+    confidence: v.number(),
+    status: v.union(v.literal("unmatched"), v.literal("suggested"), v.literal("confirmed"), v.literal("rejected")),
+    raw: v.optional(v.any()),
+    createdAt: v.number(),
+    updatedAt: v.number(),
+  })
+    .index("by_user", ["userId"])
+    .index("by_user_occurred_at", ["userId", "occurredAt"])
+    .index("by_transaction", ["matchedTransactionId"])
+    .index("by_user_status", ["userId", "status"]),
 
   receipts: defineTable({
     userId: v.id("users"),
@@ -232,6 +264,53 @@ export default defineSchema({
   })
     .index("by_user", ["userId"])
     .index("by_user_category_period", ["userId", "categoryId", "period"]),
+
+  budgetIncomeOverrides: defineTable({
+    userId: v.id("users"),
+    transactionId: v.string(),
+    included: v.boolean(),
+    createdAt: v.number(),
+    updatedAt: v.number(),
+  })
+    .index("by_user", ["userId"])
+    .index("by_user_transaction", ["userId", "transactionId"]),
+
+  recurringTransactions: defineTable({
+    userId: v.id("users"),
+    kind: v.union(v.literal("income"), v.literal("expense")),
+    status: v.union(v.literal("suggested"), v.literal("confirmed"), v.literal("ignored")),
+    cadence: v.union(v.literal("weekly"), v.literal("biweekly"), v.literal("semimonthly"), v.literal("monthly"), v.literal("irregular")),
+    normalizedKey: v.string(),
+    merchantName: v.string(),
+    categoryName: v.optional(v.string()),
+    averageAmountCents: v.int64(),
+    lastAmountCents: v.int64(),
+    transactionCount: v.number(),
+    averageIntervalDays: v.number(),
+    confidence: v.number(),
+    firstSeenAt: v.number(),
+    lastSeenAt: v.number(),
+    nextExpectedAt: v.optional(v.number()),
+    transactionIds: v.array(v.id("transactions")),
+    createdAt: v.number(),
+    updatedAt: v.number(),
+  })
+    .index("by_user", ["userId"])
+    .index("by_user_kind", ["userId", "kind"])
+    .index("by_user_status", ["userId", "status"])
+    .index("by_user_key", ["userId", "normalizedKey"]),
+
+  budgetAssistantProposals: defineTable({
+    userId: v.id("users"),
+    prompt: v.string(),
+    reply: v.string(),
+    planJson: v.string(),
+    status: v.union(v.literal("pending"), v.literal("applied"), v.literal("dismissed")),
+    createdAt: v.number(),
+    updatedAt: v.number(),
+  })
+    .index("by_user_status", ["userId", "status", "updatedAt"])
+    .index("by_user", ["userId"]),
 
   categoryRules: defineTable({
     userId: v.id("users"),

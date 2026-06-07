@@ -10,8 +10,11 @@ final class FinanceStore {
     var transactions: [Transaction] = []
     var cashflowTrendTransactions: [Transaction] = []
     var budgets: [Budget] = []
+    var budgetIncomeOverrides: [BudgetIncomeOverride] = []
+    var recurringTransactions: [RecurringTransaction] = []
     var goals: [Goal] = []
     var statements: [StatementUpload] = []
+    var transactionSignals: [TransactionSignal] = []
     var projection: [CashflowProjection] = []
     var assistantConversations: [AssistantConversation] = []
     var selectedAssistantConversationID: String?
@@ -19,14 +22,21 @@ final class FinanceStore {
     var isLoading = false
     var errorMessage: String?
     var lastPlaidSyncSummary: String?
+    var financeKitImportStatus: String?
     var assistantTypingStatus: String?
+    var lastRefreshedAt: Date?
     var transactionFilter = TransactionFilter()
+    var hasMoreTransactions = true
+    var isLoadingMoreTransactions = false
+    var isSyncingPlaid = false
     var authDisplayName = "Local Profile"
     var authEmail = "Not signed in"
     var isSignedIn = false
+    var authMigrationMessage: String?
 
     private var api: APIClient
     private let authSession: BudgetAuthSession
+    private let transactionPageSize = 80
     private var activeVoiceUserMessageID: String?
     private var activeVoiceAssistantMessageID: String?
 
@@ -47,9 +57,27 @@ final class FinanceStore {
 
     var availableCreditCents: Int64 {
         accounts.reduce(0) { total, account in
-            guard account.type == "credit", let limit = account.creditLimitCents else { return total }
-            return total + max(0, limit + account.balanceCents)
+            total + account.normalizedAvailableCreditCents
         }
+    }
+
+    var accountSourceSummary: String {
+        let counts = Dictionary(grouping: accounts, by: { $0.source.lowercased() })
+            .mapValues(\.count)
+            .sorted { lhs, rhs in
+                if lhs.value == rhs.value {
+                    return lhs.key < rhs.key
+                }
+                return lhs.value > rhs.value
+            }
+        guard !counts.isEmpty else { return "No sources" }
+        return counts
+            .map { "\(TransactionFilter.sourceLabel($0.key)): \($0.value)" }
+            .joined(separator: " · ")
+    }
+
+    var pendingTransactionCount: Int {
+        Set((transactions + cashflowTrendTransactions).filter(\.pending).map(\.id)).count
     }
 
     var categoryNames: [String] {
@@ -62,29 +90,76 @@ final class FinanceStore {
     }
 
     func refresh() async {
-        if !isSignedIn {
-            refreshAuthState()
-        }
+        refreshAuthState()
         isLoading = true
         errorMessage = nil
-        do {
-            async let fetchedAccounts = api.accounts()
-            async let fetchedTransactions = api.transactions(filter: transactionFilter)
-            async let fetchedCashflowTrendTransactions = api.transactions(limit: 1000, filter: TransactionFilter())
-            async let fetchedBudgets = api.budgets()
-            async let fetchedGoals = api.goals()
-            async let fetchedStatements = api.statements()
-            accounts = try await fetchedAccounts
-            transactions = try await fetchedTransactions
-            cashflowTrendTransactions = try await fetchedCashflowTrendTransactions
-            budgets = try await fetchedBudgets
-            goals = try await fetchedGoals
-            statements = try await fetchedStatements
-            await loadAssistantConversationsFromServer()
-        } catch {
-            errorMessage = error.localizedDescription
+        var failures: [String] = []
+
+        let fetchedAccounts: Result<[Account], Error> = await capture { try await api.accounts() }
+        async let fetchedTransactions: Result<[Transaction], Error> = capture { try await api.transactions(limit: transactionPageSize, filter: transactionFilter) }
+        async let fetchedCashflowTrendTransactions: Result<[Transaction], Error> = capture { try await api.transactions(limit: 1000, filter: TransactionFilter()) }
+        async let fetchedBudgets: Result<[Budget], Error> = capture { try await api.budgets() }
+        async let fetchedBudgetIncomeOverrides: Result<[BudgetIncomeOverride], Error> = capture { try await api.budgetIncomeOverrides() }
+        async let fetchedRecurringTransactions: Result<[RecurringTransaction], Error> = capture { try await api.recurringTransactions() }
+        async let fetchedGoals: Result<[Goal], Error> = capture { try await api.goals() }
+        async let fetchedStatements: Result<[StatementUpload], Error> = capture { try await api.statements() }
+        async let fetchedSignals: Result<[TransactionSignal], Error> = capture { try await api.transactionSignals() }
+
+        switch fetchedAccounts {
+        case .success(let value): accounts = value
+        case .failure(let error): failures.append("accounts: \(error.localizedDescription)")
+        }
+        switch await fetchedTransactions {
+        case .success(let value):
+            transactions = value
+            hasMoreTransactions = value.count == transactionPageSize
+        case .failure(let error): failures.append("transactions: \(error.localizedDescription)")
+        }
+        switch await fetchedCashflowTrendTransactions {
+        case .success(let value): cashflowTrendTransactions = value
+        case .failure(let error): failures.append("cashflow: \(error.localizedDescription)")
+        }
+        switch await fetchedBudgets {
+        case .success(let value): budgets = value
+        case .failure(let error): failures.append("budgets: \(error.localizedDescription)")
+        }
+        switch await fetchedBudgetIncomeOverrides {
+        case .success(let value): budgetIncomeOverrides = value
+        case .failure(let error): failures.append("income overrides: \(error.localizedDescription)")
+        }
+        switch await fetchedRecurringTransactions {
+        case .success(let value): recurringTransactions = value
+        case .failure(let error): failures.append("recurring: \(error.localizedDescription)")
+        }
+        switch await fetchedGoals {
+        case .success(let value): goals = value
+        case .failure(let error): failures.append("goals: \(error.localizedDescription)")
+        }
+        switch await fetchedStatements {
+        case .success(let value): statements = value
+        case .failure(let error): failures.append("statements: \(error.localizedDescription)")
+        }
+        switch await fetchedSignals {
+        case .success(let value): transactionSignals = value
+        case .failure(let error): failures.append("signals: \(error.localizedDescription)")
+        }
+
+        await loadAssistantConversationsFromServer()
+        if failures.isEmpty {
+            errorMessage = nil
+            lastRefreshedAt = Date()
+        } else {
+            errorMessage = failures.joined(separator: "\n")
         }
         isLoading = false
+    }
+
+    private func capture<Value>(_ operation: () async throws -> Value) async -> Result<Value, Error> {
+        do {
+            return .success(try await operation())
+        } catch {
+            return .failure(error)
+        }
     }
 
     func signInWithWorkOS() async {
@@ -93,6 +168,11 @@ final class FinanceStore {
         do {
             let session = try await authSession.signIn()
             api.userID = session.userID
+            if let migration = session.migration, migration.movedAccounts > 0 {
+                authMigrationMessage = "Recovered \(migration.movedAccounts) account\(migration.movedAccounts == 1 ? "" : "s") and \(migration.moved) related record\(migration.moved == 1 ? "" : "s") into this profile."
+            } else {
+                authMigrationMessage = nil
+            }
             refreshAuthState()
             await refresh()
         } catch {
@@ -108,10 +188,33 @@ final class FinanceStore {
         accounts = []
         transactions = []
         cashflowTrendTransactions = []
+        hasMoreTransactions = true
+        isLoadingMoreTransactions = false
         budgets = []
+        recurringTransactions = []
         goals = []
         statements = []
+        transactionSignals = []
         projection = []
+        authMigrationMessage = nil
+    }
+
+    func recoverWorkOSData() async {
+        guard isSignedIn else { return }
+        isLoading = true
+        errorMessage = nil
+        do {
+            let result = try await api.recoverWorkOSData(email: authEmail)
+            if let migration = result.migration, migration.movedAccounts > 0 {
+                authMigrationMessage = "Recovered \(migration.movedAccounts) account\(migration.movedAccounts == 1 ? "" : "s") and \(migration.moved) related record\(migration.moved == 1 ? "" : "s") into this profile."
+            } else {
+                authMigrationMessage = "No older accounts were found for \(authEmail)."
+            }
+            await refresh()
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+        isLoading = false
     }
 
     func addManualAccount(_ draft: ManualAccountDraft) async {
@@ -131,11 +234,24 @@ final class FinanceStore {
         }
     }
 
-    func syncPlaidTransactions() async {
+    func syncPlaidTransactions(backfill: Bool = false) async {
+        isSyncingPlaid = true
+        lastPlaidSyncSummary = nil
         await performMutation {
-            let result = try await api.syncPlaidItems()
-            lastPlaidSyncSummary = "Synced \(result.items) item\(result.items == 1 ? "" : "s"): \(result.added) new, \(result.modified) updated, \(result.removed) removed, \(result.backfilled) checked from history."
+            let result = try await api.syncPlaidItems(backfill: backfill)
+            let prefix = backfill ? "Backfilled and synced" : "Synced"
+            let history = result.backfilled > 0 ? ", \(result.backfilled) checked from history" : ""
+            lastPlaidSyncSummary = "\(prefix) \(result.items) item\(result.items == 1 ? "" : "s"): \(result.added) new, \(result.modified) updated, \(result.removed) removed\(history)."
             await refresh()
+        }
+        isSyncingPlaid = false
+    }
+
+    func createQuickTransactionSignal(_ draft: QuickTransactionSignalDraft) async {
+        await performMutation {
+            let signal = try await api.createQuickTransactionSignal(draft)
+            transactionSignals.insert(signal, at: 0)
+            lastPlaidSyncSummary = "Captured a spend timestamp for \(signal.occurredAt.formatted(date: .omitted, time: .shortened))."
         }
     }
 
@@ -164,6 +280,13 @@ final class FinanceStore {
             } else {
                 budgets = try await api.budgets()
             }
+        }
+    }
+
+    func upsertReceipt(for transaction: Transaction, draft: ReceiptDraft) async {
+        await performMutation {
+            let updated = try await api.upsertTransactionReceipt(transactionID: transaction.id, draft: draft)
+            replaceTransaction(updated)
         }
     }
 
@@ -211,8 +334,24 @@ final class FinanceStore {
     func applyTransactionFilter(_ filter: TransactionFilter) async {
         transactionFilter = filter
         await performMutation {
-            transactions = try await api.transactions(filter: filter)
+            let page = try await api.transactions(limit: transactionPageSize, filter: filter)
+            transactions = page
+            hasMoreTransactions = page.count == transactionPageSize
         }
+    }
+
+    func loadMoreTransactions() async {
+        guard hasMoreTransactions, !isLoadingMoreTransactions, !isLoading else { return }
+        isLoadingMoreTransactions = true
+        do {
+            let page = try await api.transactions(limit: transactionPageSize, offset: transactions.count, filter: transactionFilter)
+            let existingIDs = Set(transactions.map(\.id))
+            transactions.append(contentsOf: page.filter { !existingIDs.contains($0.id) })
+            hasMoreTransactions = page.count == transactionPageSize
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+        isLoadingMoreTransactions = false
     }
 
     func addStatement(_ draft: StatementDraft) async {
@@ -244,10 +383,60 @@ final class FinanceStore {
         }
     }
 
+    func detectRecurringTransactions() async {
+        await performMutation {
+            recurringTransactions = try await api.detectRecurringTransactions()
+        }
+    }
+
+    func updateRecurringTransactionStatus(_ recurring: RecurringTransaction, status: String) async {
+        await performMutation {
+            let updated = try await api.updateRecurringTransactionStatus(id: recurring.id, status: status)
+            if let index = recurringTransactions.firstIndex(where: { $0.id == updated.id }) {
+                recurringTransactions[index] = updated
+            } else {
+                recurringTransactions.append(updated)
+            }
+        }
+    }
+
+    func setBudgetIncomeOverride(transactionID: String, included: Bool) async {
+        await performMutation {
+            let override = try await api.setBudgetIncomeOverride(transactionID: transactionID, included: included)
+            if let index = budgetIncomeOverrides.firstIndex(where: { $0.transactionID == transactionID }) {
+                budgetIncomeOverrides[index] = override
+            } else {
+                budgetIncomeOverrides.append(override)
+            }
+        }
+    }
+
     func askBudgetAssistant(_ message: String) async throws -> BudgetAssistantReply {
         let reply = try await api.askBudgetAssistant(message)
         try await refreshAfterBudgetAssistant()
         return reply
+    }
+
+    func applyBudgetAssistantPlan(_ plan: BudgetAssistantPlan) async throws -> BudgetAssistantReply {
+        try await applyBudgetAssistantPlan(plan, proposalID: nil)
+    }
+
+    func applyBudgetAssistantPlan(_ plan: BudgetAssistantPlan, proposalID: String?) async throws -> BudgetAssistantReply {
+        let reply = try await api.applyBudgetAssistantPlan(plan, proposalID: proposalID)
+        try await refreshAfterBudgetAssistant()
+        return reply
+    }
+
+    func pendingBudgetAssistantProposal() async throws -> BudgetAssistantReply? {
+        try await api.pendingBudgetAssistantProposal()
+    }
+
+    func budgetAssistantProposals() async throws -> [BudgetAssistantReply] {
+        try await api.budgetAssistantProposals()
+    }
+
+    func dismissBudgetAssistantProposal(id: String) async throws {
+        try await api.dismissBudgetAssistantProposal(id: id)
     }
 
     func streamBudgetAssistant(_ message: String) -> AsyncThrowingStream<BudgetAssistantStreamEvent, Error> {
@@ -256,9 +445,11 @@ final class FinanceStore {
 
     func refreshAfterBudgetAssistant() async throws {
         async let fetchedBudgets = api.budgets()
+        async let fetchedBudgetIncomeOverrides = api.budgetIncomeOverrides()
         async let fetchedTransactions = api.transactions(filter: transactionFilter)
         async let fetchedCashflowTrendTransactions = api.transactions(limit: 1000, filter: TransactionFilter())
         budgets = try await fetchedBudgets
+        budgetIncomeOverrides = try await fetchedBudgetIncomeOverrides
         transactions = try await fetchedTransactions
         cashflowTrendTransactions = try await fetchedCashflowTrendTransactions
     }
@@ -271,12 +462,29 @@ final class FinanceStore {
     }
 
     func importFinanceKitSnapshot() async {
-        await performMutation {
-            let snapshot = try await FinanceKitImporter.loadSnapshot()
+        errorMessage = nil
+        isLoading = true
+        financeKitImportStatus = "Starting Apple Wallet import…"
+        NSLog("[FinanceStore] Starting FinanceKit import")
+        do {
+            financeKitImportStatus = "Starting Apple Wallet import…"
+            let snapshot = try await FinanceKitImporter.loadSnapshot { [weak self] phase in
+                NSLog("[FinanceStore] FinanceKit phase: %@", phase)
+                self?.financeKitImportStatus = phase
+            }
+            NSLog("[FinanceStore] FinanceKit snapshot accounts=%ld transactions=%ld", snapshot.accounts.count, snapshot.transactions.count)
+            financeKitImportStatus = "Sending Wallet data to Budget…"
             let result = try await api.importFinanceKit(accounts: snapshot.accounts, transactions: snapshot.transactions)
+            NSLog("[FinanceStore] FinanceKit backend import accounts=%ld transactions=%ld", result.accounts, result.transactions)
             lastPlaidSyncSummary = "Imported \(result.accounts) Apple Wallet account\(result.accounts == 1 ? "" : "s") and \(result.transactions) transaction\(result.transactions == 1 ? "" : "s")."
+            financeKitImportStatus = lastPlaidSyncSummary
             await refresh()
+        } catch {
+            NSLog("[FinanceStore] FinanceKit import failed: %@", error.localizedDescription)
+            errorMessage = error.localizedDescription
+            financeKitImportStatus = error.localizedDescription
         }
+        isLoading = false
     }
 
     func askAssistant(_ message: String) async {

@@ -1,5 +1,6 @@
 .env
 .env.local
+.codex-tools/
 .DS_Store
 statements_examples/
 node_modules/

@@ -53,6 +53,10 @@ File.write(info_plist, <<~PLIST)
   </dict>
   <key>UILaunchScreen</key>
   <dict/>
+  <key>NSFinancialDataUsageDescription</key>
+  <string>Budget uses financial account data to show balances, transactions, budgets, and cashflow projections.</string>
+  <key>FinanceKitManagedEntitlementEnabled</key>
+  <true/>
   <key>NSAppTransportSecurity</key>
   <dict>
     <key>NSAllowsLocalNetworking</key>
@@ -62,6 +66,28 @@ File.write(info_plist, <<~PLIST)
 </plist>
 PLIST
 plist_ref = project.main_group.new_file('BudgetApp/Info.plist')
+
+entitlements_path = File.join(root, 'BudgetApp', 'BudgetApp.entitlements')
+File.write(entitlements_path, <<~PLIST)
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>com.apple.developer.financekit</key>
+  <array>
+    <string>financial-data</string>
+  </array>
+  <key>com.apple.developer.financekit.transaction-picker</key>
+  <true/>
+  <key>com.apple.developer.pass-type-identifiers</key>
+  <array>
+    <string>$(AppIdentifierPrefix)*</string>
+  </array>
+</dict>
+</plist>
+PLIST
+project.main_group.new_file('BudgetApp/BudgetApp.entitlements')
+
 
 project.build_configurations.each do |config|
   config.build_settings['IPHONEOS_DEPLOYMENT_TARGET'] = '17.0'
@@ -76,7 +102,8 @@ target.build_configurations.each do |config|
   config.build_settings['GENERATE_INFOPLIST_FILE'] = 'NO'
   config.build_settings['ASSETCATALOG_COMPILER_APPICON_NAME'] = ''
   config.build_settings['CODE_SIGN_STYLE'] = 'Automatic'
-  config.build_settings['DEVELOPMENT_TEAM'] = ''
+  config.build_settings['CODE_SIGN_ENTITLEMENTS'] = 'BudgetApp/BudgetApp.entitlements'
+  config.build_settings['DEVELOPMENT_TEAM'] = '764FPKS8YP'
   config.build_settings['MARKETING_VERSION'] = '1.0'
   config.build_settings['CURRENT_PROJECT_VERSION'] = '1'
   config.build_settings['SUPPORTED_PLATFORMS'] = 'iphoneos iphonesimulator'

@@ -11,13 +11,20 @@ struct APIClient: Sendable {
     }
 
     func accounts() async throws -> [Account] {
-        try await get("accounts", query: ["user_id": userID])
+        var query = ["user_id": userID]
+        if let email = UserDefaults.standard.string(forKey: BudgetAuthStorage.emailKey), !email.isEmpty {
+            query["email"] = email
+        }
+        return try await get("accounts", query: query)
     }
 
-    func transactions(limit: Int = 80, filter: TransactionFilter = TransactionFilter()) async throws -> [Transaction] {
+    func transactions(limit: Int = 80, offset: Int = 0, filter: TransactionFilter = TransactionFilter()) async throws -> [Transaction] {
         var query = filter.queryItems
         query["user_id"] = userID
         query["limit"] = String(limit)
+        if offset > 0 {
+            query["offset"] = String(offset)
+        }
         return try await get("transactions", query: query)
     }
 
@@ -41,8 +48,16 @@ struct APIClient: Sendable {
         try await post("plaid/exchange-public-token", body: ["user_id": userID, "public_token": publicToken])
     }
 
-    func syncPlaidItems() async throws -> PlaidSyncResult {
-        try await post("plaid/sync", body: ["user_id": userID])
+    func syncPlaidItems(backfill: Bool = false, months: Int = 12) async throws -> PlaidSyncResult {
+        try await post("plaid/sync", body: PlaidSyncRequest(userID: userID, backfill: backfill, backfillMonths: months))
+    }
+
+    func transactionSignals(limit: Int = 50) async throws -> [TransactionSignal] {
+        try await get("transaction-signals", query: ["user_id": userID, "limit": String(limit)])
+    }
+
+    func createQuickTransactionSignal(_ draft: QuickTransactionSignalDraft) async throws -> TransactionSignal {
+        try await post("transaction-signals/quick-add", body: draft.payload(userID: userID))
     }
 
     func createManualAccount(_ draft: ManualAccountDraft) async throws -> Account {
@@ -59,6 +74,10 @@ struct APIClient: Sendable {
 
     func updateTransactionCategory(id: String, categoryName: String, applyToSimilar: Bool) async throws -> Transaction {
         try await patch("transactions/\(id)/category", body: TransactionCategoryPayload(userID: userID, categoryName: categoryName, applyToSimilar: applyToSimilar))
+    }
+
+    func upsertTransactionReceipt(transactionID: String, draft: ReceiptDraft) async throws -> Transaction {
+        try await put("transactions/\(transactionID)/receipt", body: draft.payload(userID: userID))
     }
 
     func createGoal(_ draft: GoalDraft) async throws -> Goal {
@@ -81,8 +100,53 @@ struct APIClient: Sendable {
         try await post("budgets/autogenerate", body: ["user_id": userID])
     }
 
+    func budgetIncomeOverrides() async throws -> [BudgetIncomeOverride] {
+        try await get("budgets/income-overrides", query: ["user_id": userID])
+    }
+
+    func setBudgetIncomeOverride(transactionID: String, included: Bool) async throws -> BudgetIncomeOverride {
+        try await put("budgets/income-overrides/\(transactionID)", body: BudgetIncomeOverridePayload(userID: userID, included: included))
+    }
+
+    func recurringTransactions(kind: String? = nil) async throws -> [RecurringTransaction] {
+        var query = ["user_id": userID]
+        if let kind {
+            query["kind"] = kind
+        }
+        return try await get("recurring-transactions", query: query)
+    }
+
+    func detectRecurringTransactions(lookbackDays: Int = 365) async throws -> [RecurringTransaction] {
+        try await post("recurring-transactions/detect", body: RecurringDetectionPayload(userID: userID, lookbackDays: lookbackDays))
+    }
+
+    func updateRecurringTransactionStatus(id: String, status: String) async throws -> RecurringTransaction {
+        try await put("recurring-transactions/\(id)/status", body: RecurringStatusPayload(userID: userID, status: status))
+    }
+
     func askBudgetAssistant(_ message: String) async throws -> BudgetAssistantReply {
         try await post("budgets/assistant/chat", body: ["user_id": userID, "message": message])
+    }
+
+    func applyBudgetAssistantPlan(_ plan: BudgetAssistantPlan) async throws -> BudgetAssistantReply {
+        try await applyBudgetAssistantPlan(plan, proposalID: nil)
+    }
+
+    func applyBudgetAssistantPlan(_ plan: BudgetAssistantPlan, proposalID: String?) async throws -> BudgetAssistantReply {
+        try await post("budgets/assistant/apply", body: BudgetAssistantApplyRequest(userID: userID, proposalID: proposalID, plan: plan))
+    }
+
+    func pendingBudgetAssistantProposal() async throws -> BudgetAssistantReply? {
+        let response: PendingBudgetAssistantProposalResponse = try await get("budgets/assistant/proposals/pending", query: ["user_id": userID])
+        return response.proposal
+    }
+
+    func budgetAssistantProposals(limit: Int = 25) async throws -> [BudgetAssistantReply] {
+        try await get("budgets/assistant/proposals", query: ["user_id": userID, "limit": String(limit)])
+    }
+
+    func dismissBudgetAssistantProposal(id: String) async throws {
+        try await delete("budgets/assistant/proposals/\(id)", query: ["user_id": userID])
     }
 
     func streamBudgetAssistant(_ message: String) -> AsyncThrowingStream<BudgetAssistantStreamEvent, Error> {
@@ -214,12 +278,20 @@ struct APIClient: Sendable {
         try await get("auth/workos/authorize-url", query: ["state": state])
     }
 
-    func exchangeWorkOSCode(_ code: String) async throws -> WorkOSAuthResponse {
-        try await post("auth/workos/callback", body: ["code": code])
+    func exchangeWorkOSCode(_ code: String, migrateFromUserID: String? = nil) async throws -> WorkOSAuthResponse {
+        var body = ["code": code]
+        if let migrateFromUserID, !migrateFromUserID.isEmpty {
+            body["migrate_from_user_id"] = migrateFromUserID
+        }
+        return try await post("auth/workos/callback", body: body)
     }
 
     func refreshWorkOSSession(refreshToken: String) async throws -> WorkOSTokenRefreshResponse {
         try await post("auth/workos/refresh", body: ["refresh_token": refreshToken])
+    }
+
+    func recoverWorkOSData(email: String) async throws -> WorkOSRecoverResponse {
+        try await post("auth/workos/recover", body: ["user_id": userID, "email": email])
     }
 
     private func get<T: Decodable>(_ path: String, query: [String: String]) async throws -> T {
@@ -407,6 +479,22 @@ private struct BudgetAssistantChatRequest: Encodable {
     }
 }
 
+private struct BudgetAssistantApplyRequest: Encodable {
+    let userID: String
+    let proposalID: String?
+    let plan: BudgetAssistantPlan
+
+    enum CodingKeys: String, CodingKey {
+        case userID = "user_id"
+        case proposalID = "proposal_id"
+        case plan
+    }
+}
+
+private struct PendingBudgetAssistantProposalResponse: Decodable {
+    let proposal: BudgetAssistantReply?
+}
+
 private struct AssistantChatRequest: Encodable {
     let userID: String
     let conversationID: String?
@@ -447,6 +535,7 @@ struct WorkOSAuthResponse: Codable, Hashable {
     let accessToken: String
     let refreshToken: String
     let organizationID: String?
+    let migration: WorkOSMigrationSummary?
 
     enum CodingKeys: String, CodingKey {
         case userID = "user_id"
@@ -456,6 +545,21 @@ struct WorkOSAuthResponse: Codable, Hashable {
         case accessToken = "access_token"
         case refreshToken = "refresh_token"
         case organizationID = "organization_id"
+        case migration
+    }
+}
+
+struct WorkOSMigrationSummary: Codable, Hashable {
+    let moved: Int
+    let movedAccounts: Int
+    let skippedAccounts: Int
+    let skipped: Bool?
+
+    enum CodingKeys: String, CodingKey {
+        case moved
+        case movedAccounts = "moved_accounts"
+        case skippedAccounts = "skipped_accounts"
+        case skipped
     }
 }
 
@@ -466,6 +570,16 @@ struct WorkOSTokenRefreshResponse: Codable, Hashable {
     enum CodingKeys: String, CodingKey {
         case accessToken = "access_token"
         case refreshToken = "refresh_token"
+    }
+}
+
+struct WorkOSRecoverResponse: Codable, Hashable {
+    let migration: WorkOSMigrationSummary?
+    let existingAccounts: Int
+
+    enum CodingKeys: String, CodingKey {
+        case migration
+        case existingAccounts = "existing_accounts"
     }
 }
 
@@ -516,6 +630,7 @@ struct FinanceKitTransactionImport: Codable, Hashable {
     let merchantName: String
     let amountCents: Int64
     let currencyCode: String
+    let authorizedAt: Date
     let postedAt: Date
     let pending: Bool
     let locationName: String
@@ -529,11 +644,79 @@ struct FinanceKitTransactionImport: Codable, Hashable {
         case merchantName = "merchant_name"
         case amountCents = "amount_cents"
         case currencyCode = "currency_code"
+        case authorizedAt = "authorized_at"
         case postedAt = "posted_at"
         case pending
         case locationName = "location_name"
         case transactionType = "transaction_type"
         case status
+    }
+}
+
+struct TransactionSignal: Codable, Identifiable, Hashable {
+    let id: String
+    let userID: String
+    let source: String
+    let amountCents: Int64?
+    let merchantHint: String?
+    let occurredAt: Date
+    let locationName: String?
+    let latitude: Double?
+    let longitude: Double?
+    let matchedTransactionID: String?
+    let confidence: Double
+    let status: String
+    let createdAt: Date
+    let updatedAt: Date
+
+    enum CodingKeys: String, CodingKey {
+        case id
+        case userID = "user_id"
+        case source
+        case amountCents = "amount_cents"
+        case merchantHint = "merchant_hint"
+        case occurredAt = "occurred_at"
+        case locationName = "location_name"
+        case latitude
+        case longitude
+        case matchedTransactionID = "matched_transaction_id"
+        case confidence
+        case status
+        case createdAt = "created_at"
+        case updatedAt = "updated_at"
+    }
+}
+
+struct QuickTransactionSignalDraft: Hashable {
+    var amount: Decimal?
+    var merchantHint: String
+    var occurredAt: Date = Date()
+    var locationName: String = ""
+
+    fileprivate func payload(userID: String) -> QuickTransactionSignalPayload {
+        QuickTransactionSignalPayload(
+            userID: userID,
+            amountCents: amount.map { NSDecimalNumber(decimal: $0 * 100).rounding(accordingToBehavior: nil).int64Value },
+            merchantHint: merchantHint.trimmingCharacters(in: .whitespacesAndNewlines),
+            occurredAt: occurredAt,
+            locationName: locationName.trimmingCharacters(in: .whitespacesAndNewlines)
+        )
+    }
+}
+
+private struct QuickTransactionSignalPayload: Encodable {
+    let userID: String
+    let amountCents: Int64?
+    let merchantHint: String
+    let occurredAt: Date
+    let locationName: String
+
+    enum CodingKeys: String, CodingKey {
+        case userID = "user_id"
+        case amountCents = "amount_cents"
+        case merchantHint = "merchant_hint"
+        case occurredAt = "occurred_at"
+        case locationName = "location_name"
     }
 }
 
@@ -584,7 +767,7 @@ final class BudgetAuthSession: NSObject, ASWebAuthenticationPresentationContextP
         else {
             throw APIError.badStatus(400, "WorkOS callback did not include an authorization code.")
         }
-        let response = try await api.exchangeWorkOSCode(code)
+        let response = try await api.exchangeWorkOSCode(code, migrateFromUserID: api.userID)
         persist(response)
         return response
     }
@@ -833,6 +1016,117 @@ private struct TransactionCategoryPayload: Encodable {
     }
 }
 
+struct ReceiptLineItemDraft: Identifiable, Hashable {
+    var id = UUID()
+    var name = ""
+    var quantity = ""
+    var amountText = ""
+    var categoryName = ""
+
+    var amountCents: Int64 {
+        let cleaned = amountText.replacingOccurrences(of: "$", with: "").trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let amount = Decimal(string: cleaned) else { return 0 }
+        return NSDecimalNumber(decimal: amount * Decimal(100)).int64Value
+    }
+}
+
+struct ReceiptDraft: Hashable {
+    var merchantName = ""
+    var purchasedAt = Date()
+    var totalText = ""
+    var currencyCode = "USD"
+    var lineItems: [ReceiptLineItemDraft] = []
+
+    var totalCents: Int64 {
+        let cleaned = totalText.replacingOccurrences(of: "$", with: "").trimmingCharacters(in: .whitespacesAndNewlines)
+        if let amount = Decimal(string: cleaned), !cleaned.isEmpty {
+            return NSDecimalNumber(decimal: amount * Decimal(100)).int64Value
+        }
+        return lineItems.reduce(Int64(0)) { $0 + $1.amountCents }
+    }
+
+    fileprivate func payload(userID: String) -> ReceiptPayload {
+        ReceiptPayload(
+            userID: userID,
+            merchantName: merchantName.trimmingCharacters(in: .whitespacesAndNewlines),
+            purchasedAt: purchasedAt,
+            totalCents: totalCents,
+            currencyCode: currencyCode,
+            lineItems: lineItems
+                .filter { !$0.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && $0.amountCents != 0 }
+                .map {
+                    ReceiptLineItemPayload(
+                        name: $0.name.trimmingCharacters(in: .whitespacesAndNewlines),
+                        quantity: $0.quantity.trimmingCharacters(in: .whitespacesAndNewlines),
+                        amountCents: $0.amountCents,
+                        categoryName: $0.categoryName.trimmingCharacters(in: .whitespacesAndNewlines)
+                    )
+                }
+        )
+    }
+}
+
+private struct ReceiptPayload: Encodable {
+    let userID: String
+    let merchantName: String
+    let purchasedAt: Date
+    let totalCents: Int64
+    let currencyCode: String
+    let lineItems: [ReceiptLineItemPayload]
+
+    enum CodingKeys: String, CodingKey {
+        case userID = "user_id"
+        case merchantName = "merchant_name"
+        case purchasedAt = "purchased_at"
+        case totalCents = "total_cents"
+        case currencyCode = "currency_code"
+        case lineItems = "line_items"
+    }
+}
+
+private struct ReceiptLineItemPayload: Encodable {
+    let name: String
+    let quantity: String
+    let amountCents: Int64
+    let categoryName: String
+
+    enum CodingKeys: String, CodingKey {
+        case name, quantity
+        case amountCents = "amount_cents"
+        case categoryName = "category_name"
+    }
+}
+
+private struct BudgetIncomeOverridePayload: Encodable {
+    let userID: String
+    let included: Bool
+
+    enum CodingKeys: String, CodingKey {
+        case userID = "user_id"
+        case included
+    }
+}
+
+private struct RecurringDetectionPayload: Encodable {
+    let userID: String
+    let lookbackDays: Int
+
+    enum CodingKeys: String, CodingKey {
+        case userID = "user_id"
+        case lookbackDays = "lookback_days"
+    }
+}
+
+private struct RecurringStatusPayload: Encodable {
+    let userID: String
+    let status: String
+
+    enum CodingKeys: String, CodingKey {
+        case userID = "user_id"
+        case status
+    }
+}
+
 private struct GoalPayload: Encodable {
     let userID: String
     let name: String
@@ -933,12 +1227,34 @@ struct PlaidExchangeResult: Decodable, Hashable {
     let accounts: [Account]
 }
 
+private struct PlaidSyncRequest: Encodable {
+    let userID: String
+    let backfill: Bool
+    let backfillMonths: Int
+
+    enum CodingKeys: String, CodingKey {
+        case userID = "user_id"
+        case backfill
+        case backfillMonths = "backfill_months"
+    }
+}
+
 struct PlaidSyncResult: Decodable, Hashable {
     let items: Int
     let added: Int
     let modified: Int
     let removed: Int
     let backfilled: Int
+    let backfillRequested: Bool?
+
+    enum CodingKeys: String, CodingKey {
+        case items
+        case added
+        case modified
+        case removed
+        case backfilled
+        case backfillRequested = "backfill_requested"
+    }
 }
 
 enum APIError: LocalizedError {

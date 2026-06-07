@@ -5,8 +5,8 @@ struct BudgetsView: View {
     @State private var showingCreateBudget = false
     @State private var showingBudgetAssistant = false
     @State private var showingIncomeReview = false
+    @State private var showingRecurringReview = false
     @State private var selectedMonth = Date()
-    @State private var incomeOverrides = BudgetIncomeOverrides.load()
 
     private var selectedMonthInterval: DateInterval {
         Calendar.current.dateInterval(of: .month, for: selectedMonth) ?? DateInterval(start: selectedMonth, duration: 30 * 86_400)
@@ -18,6 +18,10 @@ struct BudgetsView: View {
 
     private var selectedMonthTransactions: [Transaction] {
         budgetTransactions.filter { selectedMonthInterval.contains($0.postedAt) }
+    }
+
+    private var incomeOverrides: BudgetIncomeOverrides {
+        BudgetIncomeOverrides(overrides: store.budgetIncomeOverrides)
     }
 
     private var incomeInsight: IncomeInsight {
@@ -50,6 +54,10 @@ struct BudgetsView: View {
             }
     }
 
+    private var suggestedRecurring: [RecurringTransaction] {
+        store.recurringTransactions.filter { $0.status == "suggested" }
+    }
+
     var body: some View {
         NavigationStack {
             Group {
@@ -70,6 +78,13 @@ struct BudgetsView: View {
                                 .onTapGesture {
                                     showingIncomeReview = true
                                 }
+                            RecurringInsightsCard(
+                                recurringTransactions: store.recurringTransactions,
+                                suggestedCount: suggestedRecurring.count,
+                                detect: { Task { await store.detectRecurringTransactions() } },
+                                review: { showingRecurringReview = true }
+                            )
+                                .padding(.horizontal)
                             ContentUnavailableView {
                                 Label("No Budgets", systemImage: "chart.pie")
                             } description: {
@@ -113,6 +128,16 @@ struct BudgetsView: View {
                                 .onTapGesture {
                                     showingIncomeReview = true
                                 }
+                        }
+                        Section {
+                            RecurringInsightsCard(
+                                recurringTransactions: store.recurringTransactions,
+                                suggestedCount: suggestedRecurring.count,
+                                detect: { Task { await store.detectRecurringTransactions() } },
+                                review: { showingRecurringReview = true }
+                            )
+                                .listRowInsets(EdgeInsets(top: 4, leading: 16, bottom: 8, trailing: 16))
+                                .listRowBackground(Color.clear)
                         }
                         Section("Categories") {
                             ForEach(budgetPaces) { pace in
@@ -162,7 +187,10 @@ struct BudgetsView: View {
                 BudgetAssistantView(store: store)
             }
             .sheet(isPresented: $showingIncomeReview) {
-                IncomeReviewView(transactions: selectedMonthTransactions, month: selectedMonth, overrides: $incomeOverrides)
+                IncomeReviewView(store: store, transactions: selectedMonthTransactions, month: selectedMonth, overrides: incomeOverrides)
+            }
+            .sheet(isPresented: $showingRecurringReview) {
+                RecurringReviewView(store: store)
             }
         }
     }
@@ -225,33 +253,16 @@ private struct BudgetPeriodSelector: View {
     }
 }
 
-private struct BudgetIncomeOverrides: Codable, Hashable {
-    static private let key = "BudgetApp.budgetIncomeOverrides"
+private struct BudgetIncomeOverrides: Hashable {
+    var decisionsByTransactionID: [String: Bool] = [:]
 
-    var includedTransactionIDs = Set<String>()
-    var excludedTransactionIDs = Set<String>()
-
-    static func load() -> BudgetIncomeOverrides {
-        guard
-            let data = UserDefaults.standard.data(forKey: key),
-            let decoded = try? JSONDecoder().decode(BudgetIncomeOverrides.self, from: data)
-        else {
-            return BudgetIncomeOverrides()
-        }
-        return decoded
-    }
-
-    func save() {
-        guard let data = try? JSONEncoder().encode(self) else { return }
-        UserDefaults.standard.set(data, forKey: Self.key)
+    init(overrides: [BudgetIncomeOverride] = []) {
+        decisionsByTransactionID = Dictionary(uniqueKeysWithValues: overrides.map { ($0.transactionID, $0.included) })
     }
 
     func includes(_ transaction: Transaction) -> Bool {
-        if excludedTransactionIDs.contains(transaction.id) {
-            return false
-        }
-        if includedTransactionIDs.contains(transaction.id) {
-            return true
+        if let included = decisionsByTransactionID[transaction.id] {
+            return included
         }
         return BudgetIncomeClassifier.looksLikeIncome(transaction)
     }
@@ -285,9 +296,10 @@ private enum BudgetIncomeClassifier {
 }
 
 private struct IncomeReviewView: View {
+    @Bindable var store: FinanceStore
     let transactions: [Transaction]
     let month: Date
-    @Binding var overrides: BudgetIncomeOverrides
+    let overrides: BudgetIncomeOverrides
     @Environment(\.dismiss) private var dismiss
 
     private var positiveTransactions: [Transaction] {
@@ -327,7 +339,7 @@ private struct IncomeReviewView: View {
                     } else {
                         ForEach(positiveTransactions) { transaction in
                             Button {
-                                toggle(transaction)
+                                Task { await toggle(transaction) }
                             } label: {
                                 HStack(spacing: 12) {
                                     Image(systemName: overrides.includes(transaction) ? "checkmark.circle.fill" : "circle")
@@ -361,15 +373,8 @@ private struct IncomeReviewView: View {
         }
     }
 
-    private func toggle(_ transaction: Transaction) {
-        if overrides.includes(transaction) {
-            overrides.excludedTransactionIDs.insert(transaction.id)
-            overrides.includedTransactionIDs.remove(transaction.id)
-        } else {
-            overrides.includedTransactionIDs.insert(transaction.id)
-            overrides.excludedTransactionIDs.remove(transaction.id)
-        }
-        overrides.save()
+    private func toggle(_ transaction: Transaction) async {
+        await store.setBudgetIncomeOverride(transactionID: transaction.id, included: !overrides.includes(transaction))
     }
 }
 
@@ -463,6 +468,200 @@ private struct BudgetOverviewMetric: View {
     }
 }
 
+private struct RecurringInsightsCard: View {
+    let recurringTransactions: [RecurringTransaction]
+    let suggestedCount: Int
+    let detect: () -> Void
+    let review: () -> Void
+
+    private var confirmedIncome: [RecurringTransaction] {
+        recurringTransactions.filter { $0.kind == "income" && $0.status != "ignored" }
+    }
+
+    private var confirmedExpenses: [RecurringTransaction] {
+        recurringTransactions.filter { $0.kind == "expense" && $0.status != "ignored" }
+    }
+
+    private var projectedIncome: Int64 {
+        confirmedIncome.reduce(Int64(0)) { $0 + monthlyAmount($1) }
+    }
+
+    private var projectedBills: Int64 {
+        confirmedExpenses.reduce(Int64(0)) { $0 + monthlyAmount($1) }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack {
+                Label("Recurring money", systemImage: "repeat.circle.fill")
+                    .font(.headline)
+                Spacer()
+                if suggestedCount > 0 {
+                    Text("\(suggestedCount) to review")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(AppDesign.warning)
+                }
+            }
+            HStack(spacing: 10) {
+                BudgetOverviewMetric(title: "Income", value: projectedIncome > 0 ? AppDesign.money(projectedIncome) : "Detect", subtitle: "monthly estimate", tint: AppDesign.positive)
+                BudgetOverviewMetric(title: "Bills", value: projectedBills > 0 ? AppDesign.money(projectedBills) : "Unknown", subtitle: "fixed expenses", tint: AppDesign.warning)
+            }
+            if let next = recurringTransactions
+                .filter({ $0.status != "ignored" && $0.nextExpectedAt != nil })
+                .min(by: { ($0.nextExpectedAt ?? .distantFuture) < ($1.nextExpectedAt ?? .distantFuture) }) {
+                HStack(spacing: 10) {
+                    Image(systemName: next.isIncome ? "arrow.down.circle.fill" : "arrow.up.circle.fill")
+                        .foregroundStyle(next.isIncome ? AppDesign.positive : AppDesign.warning)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(next.merchantName)
+                            .font(.subheadline.weight(.semibold))
+                            .lineLimit(1)
+                        Text("Next \(next.cadenceLabel.lowercased()) · \(next.nextExpectedAt?.formatted(date: .abbreviated, time: .omitted) ?? "unknown")")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                    Text(AppDesign.money(next.displayAmountCents))
+                        .font(.subheadline.weight(.semibold))
+                        .monospacedDigit()
+                }
+            }
+            HStack {
+                Button {
+                    detect()
+                } label: {
+                    Label("Detect", systemImage: "wand.and.stars")
+                }
+                .buttonStyle(.bordered)
+                Button {
+                    review()
+                } label: {
+                    Label("Review", systemImage: "checklist")
+                }
+                .buttonStyle(.borderedProminent)
+            }
+        }
+        .padding(16)
+        .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 22, style: .continuous))
+    }
+
+    private func monthlyAmount(_ recurring: RecurringTransaction) -> Int64 {
+        let amount = recurring.displayAmountCents
+        switch recurring.cadence {
+        case "weekly": return amount * 52 / 12
+        case "biweekly": return amount * 26 / 12
+        case "semimonthly": return amount * 2
+        case "monthly": return amount
+        default: return recurring.averageIntervalDays > 0 ? Int64((Double(amount) * 30.4375 / Double(recurring.averageIntervalDays)).rounded()) : amount
+        }
+    }
+}
+
+private struct RecurringReviewView: View {
+    @Bindable var store: FinanceStore
+    @Environment(\.dismiss) private var dismiss
+
+    private var grouped: [(String, [RecurringTransaction])] {
+        [
+            ("Income", store.recurringTransactions.filter { $0.kind == "income" && $0.status != "ignored" }),
+            ("Bills and subscriptions", store.recurringTransactions.filter { $0.kind == "expense" && $0.status != "ignored" }),
+            ("Ignored", store.recurringTransactions.filter { $0.status == "ignored" })
+        ].filter { !$0.1.isEmpty }
+    }
+
+    var body: some View {
+        NavigationStack {
+            List {
+                Section {
+                    Text("Detected recurring items come from Plaid transaction history. Confirm them to use them for budget planning and cashflow projections, or ignore false positives.")
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                    Button {
+                        Task { await store.detectRecurringTransactions() }
+                    } label: {
+                        Label("Run detection again", systemImage: "wand.and.stars")
+                    }
+                }
+                if store.recurringTransactions.isEmpty {
+                    ContentUnavailableView("No recurring items yet", systemImage: "repeat", description: Text("Run detection after syncing at least a few months of Plaid transactions."))
+                }
+                ForEach(grouped, id: \.0) { title, rows in
+                    Section(title) {
+                        ForEach(rows) { recurring in
+                            RecurringReviewRow(recurring: recurring) {
+                                Task { await store.updateRecurringTransactionStatus(recurring, status: "confirmed") }
+                            } ignore: {
+                                Task { await store.updateRecurringTransactionStatus(recurring, status: "ignored") }
+                            } restore: {
+                                Task { await store.updateRecurringTransactionStatus(recurring, status: "suggested") }
+                            }
+                        }
+                    }
+                }
+            }
+            .navigationTitle("Recurring")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Done") { dismiss() }
+                }
+            }
+        }
+    }
+}
+
+private struct RecurringReviewRow: View {
+    let recurring: RecurringTransaction
+    let confirm: () -> Void
+    let ignore: () -> Void
+    let restore: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(alignment: .top, spacing: 12) {
+                Image(systemName: recurring.isIncome ? "arrow.down.circle.fill" : "arrow.up.circle.fill")
+                    .font(.title3)
+                    .foregroundStyle(recurring.isIncome ? AppDesign.positive : AppDesign.warning)
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(recurring.merchantName)
+                        .font(.headline)
+                    Text([recurring.categoryName, recurring.cadenceLabel, recurring.confidenceLabel].compactMap { $0 }.joined(separator: " · "))
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+                VStack(alignment: .trailing, spacing: 3) {
+                    Text(AppDesign.money(recurring.displayAmountCents))
+                        .font(.headline)
+                        .monospacedDigit()
+                    Text("\(recurring.transactionCount)x")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            HStack {
+                if let nextExpectedAt = recurring.nextExpectedAt {
+                    Label(nextExpectedAt.formatted(date: .abbreviated, time: .omitted), systemImage: "calendar")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+                if recurring.status == "ignored" {
+                    Button("Restore", action: restore)
+                        .buttonStyle(.bordered)
+                } else {
+                    Button(recurring.status == "confirmed" ? "Confirmed" : "Confirm", action: confirm)
+                        .buttonStyle(.borderedProminent)
+                        .disabled(recurring.status == "confirmed")
+                    Button("Ignore", role: .destructive, action: ignore)
+                        .buttonStyle(.bordered)
+                }
+            }
+        }
+        .padding(.vertical, 6)
+    }
+}
+
 private struct BudgetAssistantView: View {
     @Bindable var store: FinanceStore
     @Environment(\.dismiss) private var dismiss
@@ -471,6 +670,9 @@ private struct BudgetAssistantView: View {
     ]
     @State private var draft = ""
     @State private var isSending = false
+    @State private var isApplying = false
+    @State private var isLoadingPendingProposal = false
+    @State private var showingHistory = false
     @State private var thinkingStatus: String?
     @State private var lastReply: BudgetAssistantReply?
 
@@ -498,8 +700,19 @@ private struct BudgetAssistantView: View {
                             }
                             if let lastReply {
                                 BudgetAssistantActionSummary(reply: lastReply)
+                                if let plan = lastReply.plan {
+                                    if lastReply.normalizedMode == "pending" || lastReply.normalizedMode == "proposal" {
+                                        BudgetAssistantReviewCard(reply: lastReply, plan: plan, budgets: store.budgets, transactions: store.transactions + store.cashflowTrendTransactions, isApplying: isApplying) {
+                                            Task { await apply(plan, proposalID: lastReply.proposalID) }
+                                        } dismiss: {
+                                            Task { await dismissProposal(lastReply.proposalID) }
+                                        }
+                                    } else {
+                                        BudgetAssistantPlanSnapshotCard(reply: lastReply, plan: plan, budgets: store.budgets, transactions: store.transactions + store.cashflowTrendTransactions)
+                                    }
+                                }
                             }
-                            if isSending {
+                            if isSending || isLoadingPendingProposal {
                                 Label(thinkingStatus ?? "Thinking…", systemImage: "sparkles")
                                     .font(.caption.weight(.medium))
                                     .foregroundStyle(.secondary)
@@ -517,6 +730,9 @@ private struct BudgetAssistantView: View {
                     Task { await send() }
                 }
             }
+            .task {
+                await loadPendingProposal()
+            }
             .navigationTitle("Budget AI")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
@@ -525,12 +741,27 @@ private struct BudgetAssistantView: View {
                 }
                 ToolbarItem(placement: .topBarTrailing) {
                     Button {
+                        showingHistory = true
+                    } label: {
+                        Image(systemName: "clock.arrow.circlepath")
+                    }
+                }
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button {
                         messages = [BudgetAssistantMessage(role: .assistant, content: "Started a fresh budget planning session. Tell me the categories, limits, or cleanup you want.")]
                         lastReply = nil
                         thinkingStatus = nil
+                        isApplying = false
                     } label: {
                         Image(systemName: "square.and.pencil")
                     }
+                }
+            }
+            .sheet(isPresented: $showingHistory) {
+                BudgetAssistantHistoryView(store: store) { proposal in
+                    lastReply = proposal
+                    messages.append(BudgetAssistantMessage(role: .assistant, content: "Opened a saved \(proposal.mode ?? "proposal") plan for review."))
+                    showingHistory = false
                 }
             }
         }
@@ -538,7 +769,7 @@ private struct BudgetAssistantView: View {
 
     private func send() async {
         let text = draft.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !text.isEmpty, !isSending else { return }
+        guard !text.isEmpty, !isSending, !isApplying else { return }
         draft = ""
         lastReply = nil
         thinkingStatus = "Thinking…"
@@ -562,8 +793,7 @@ private struct BudgetAssistantView: View {
                     if let index = messages.firstIndex(where: { $0.id == assistantID }), messages[index].content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                         messages[index].content = responseText(from: reply)
                     }
-                    thinkingStatus = "Finished"
-                    try await store.refreshAfterBudgetAssistant()
+                    thinkingStatus = "Ready for review"
                 }
             }
         } catch {
@@ -575,6 +805,53 @@ private struct BudgetAssistantView: View {
         }
         thinkingStatus = nil
         isSending = false
+    }
+
+    private func loadPendingProposal() async {
+        guard lastReply == nil, !isLoadingPendingProposal else { return }
+        isLoadingPendingProposal = true
+        thinkingStatus = "Checking for saved proposals…"
+        defer {
+            isLoadingPendingProposal = false
+            thinkingStatus = nil
+        }
+        do {
+            guard let proposal = try await store.pendingBudgetAssistantProposal() else { return }
+            lastReply = proposal
+            messages.append(BudgetAssistantMessage(role: .assistant, content: "I restored a budget plan that is waiting for your review."))
+        } catch {
+            messages.append(BudgetAssistantMessage(role: .assistant, content: "I could not load saved budget proposals: \(error.localizedDescription)"))
+        }
+    }
+
+    private func apply(_ plan: BudgetAssistantPlan, proposalID: String?) async {
+        guard !isApplying, !isSending else { return }
+        isApplying = true
+        thinkingStatus = "Applying approved changes…"
+        do {
+            let reply = try await store.applyBudgetAssistantPlan(plan, proposalID: proposalID)
+            lastReply = reply
+            messages.append(BudgetAssistantMessage(role: .assistant, content: responseText(from: reply)))
+            thinkingStatus = "Applied"
+        } catch {
+            messages.append(BudgetAssistantMessage(role: .assistant, content: "I could not apply the approved changes: \(error.localizedDescription)"))
+        }
+        thinkingStatus = nil
+        isApplying = false
+    }
+
+    private func dismissProposal(_ proposalID: String?) async {
+        guard let proposalID else {
+            lastReply = nil
+            return
+        }
+        do {
+            try await store.dismissBudgetAssistantProposal(id: proposalID)
+            lastReply = nil
+            messages.append(BudgetAssistantMessage(role: .assistant, content: "Dismissed that proposal. Tell me what you want to plan next."))
+        } catch {
+            messages.append(BudgetAssistantMessage(role: .assistant, content: "I could not dismiss that proposal: \(error.localizedDescription)"))
+        }
     }
 
     private func responseText(from reply: BudgetAssistantReply) -> String {
@@ -612,7 +889,7 @@ private struct BudgetAssistantCapabilityCard: View {
                 Text("Budget operator")
                     .font(.headline)
             }
-            Text("This assistant can apply budget changes and classify high-confidence transactions. Low-confidence matches stay untouched and come back as questions.")
+            Text("This assistant proposes budget changes and transaction classifications first. Nothing changes until you review and apply the plan.")
                 .font(.subheadline)
                 .foregroundStyle(.secondary)
         }
@@ -692,6 +969,322 @@ private struct BudgetAssistantActionSummary: View {
     }
 }
 
+private struct BudgetAssistantReviewCard: View {
+    let reply: BudgetAssistantReply
+    let plan: BudgetAssistantPlan
+    let budgets: [Budget]
+    let transactions: [Transaction]
+    let isApplying: Bool
+    let apply: () -> Void
+    let dismiss: () -> Void
+    @State private var showingApplyConfirmation = false
+
+    private var budgetActions: [BudgetAssistantBudgetAction] {
+        plan.budgets.filter { !$0.categoryName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+    }
+
+    private var classifications: [BudgetAssistantClassification] {
+        plan.classifications.filter { $0.confidence >= 0.72 }
+    }
+
+    private var needsConfirmation: Bool {
+        budgetActions.count + classifications.count > 1 || budgetActions.contains { $0.operation.lowercased() == "delete" || $0.operation.lowercased() == "remove" }
+    }
+
+    private var changeCount: Int {
+        budgetActions.count + classifications.count
+    }
+
+    private var includesDeletes: Bool {
+        budgetActions.contains { $0.operation.lowercased() == "delete" || $0.operation.lowercased() == "remove" }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack(spacing: 10) {
+                Image(systemName: "checklist")
+                    .foregroundStyle(.yellow)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Review before applying")
+                        .font(.headline)
+                    Text("\(budgetActions.count) budget edits · \(classifications.count) classifications")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+            }
+
+            if !budgetActions.isEmpty {
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("Budget edits")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                    ForEach(budgetActions.prefix(6)) { action in
+                        BudgetAssistantBudgetDiffRow(action: action, existingBudget: existingBudget(for: action))
+                    }
+                    if budgetActions.count > 6 {
+                        Text("+\(budgetActions.count - 6) more budget edit\(budgetActions.count - 6 == 1 ? "" : "s")")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+            }
+
+            if !classifications.isEmpty {
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("Classifications")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                    ForEach(classifications.prefix(5)) { item in
+                        BudgetAssistantClassificationDiffRow(classification: item, transaction: transaction(for: item))
+                    }
+                    if classifications.count > 5 {
+                        Text("+\(classifications.count - 5) more classification\(classifications.count - 5 == 1 ? "" : "s")")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+            }
+
+            let reviewOnly = plan.classifications.filter { $0.confidence < 0.72 }
+            if !reviewOnly.isEmpty {
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("Needs confirmation")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                    ForEach(reviewOnly.prefix(3)) { item in
+                        HStack(spacing: 10) {
+                            Image(systemName: "questionmark.circle")
+                                .foregroundStyle(AppDesign.warning)
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(transaction(for: item)?.merchantName ?? transaction(for: item)?.description ?? "Transaction")
+                                    .lineLimit(1)
+                                Text("Suggested \(item.categoryName) · \(Int((item.confidence * 100).rounded()))% confidence")
+                                    .font(.caption2)
+                                    .foregroundStyle(.secondary)
+                                    .lineLimit(1)
+                            }
+                        }
+                        .font(.subheadline)
+                    }
+                }
+            }
+
+            HStack(spacing: 10) {
+                Button("Dismiss", role: .cancel, action: dismiss)
+                    .buttonStyle(.bordered)
+                    .disabled(isApplying)
+                Button {
+                    if needsConfirmation {
+                        showingApplyConfirmation = true
+                    } else {
+                        apply()
+                    }
+                } label: {
+                    Label(isApplying ? "Applying…" : "Apply Changes", systemImage: isApplying ? "hourglass" : "checkmark.circle.fill")
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(isApplying || (budgetActions.isEmpty && classifications.isEmpty))
+            }
+        }
+        .padding(16)
+        .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 22, style: .continuous))
+        .confirmationDialog("Apply Budget AI plan?", isPresented: $showingApplyConfirmation, titleVisibility: .visible) {
+            if includesDeletes {
+                Button("Apply \(changeCount) change\(changeCount == 1 ? "" : "s")", role: .destructive) {
+                    apply()
+                }
+            } else {
+                Button("Apply \(changeCount) change\(changeCount == 1 ? "" : "s")") {
+                    apply()
+                }
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text(includesDeletes ? "This includes budget deletions. High-confidence classifications will also be applied; low-confidence suggestions remain for review." : "This will update budgets and classify high-confidence transactions. Low-confidence suggestions remain for review.")
+        }
+    }
+
+    private func existingBudget(for action: BudgetAssistantBudgetAction) -> Budget? {
+        let normalized = action.categoryName.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return budgets.first { $0.categoryName.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == normalized }
+    }
+
+    private func transaction(for classification: BudgetAssistantClassification) -> Transaction? {
+        transactions.first { $0.id == classification.transactionID }
+    }
+}
+
+private struct BudgetAssistantPlanSnapshotCard: View {
+    let reply: BudgetAssistantReply
+    let plan: BudgetAssistantPlan
+    let budgets: [Budget]
+    let transactions: [Transaction]
+
+    private var budgetActions: [BudgetAssistantBudgetAction] {
+        plan.budgets.filter { !$0.categoryName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+    }
+
+    private var classifications: [BudgetAssistantClassification] {
+        plan.classifications.filter { $0.confidence >= 0.72 }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack(spacing: 10) {
+                Image(systemName: reply.normalizedMode == "applied" ? "checkmark.seal.fill" : "archivebox.fill")
+                    .foregroundStyle(reply.normalizedMode == "applied" ? AppDesign.positive : .secondary)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(reply.normalizedMode == "applied" ? "Applied plan details" : "Dismissed plan details")
+                        .font(.headline)
+                    Text("\(budgetActions.count) budget edits · \(classifications.count) classifications")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+            }
+
+            if !budgetActions.isEmpty {
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("Budget edits")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                    ForEach(budgetActions.prefix(8)) { action in
+                        BudgetAssistantBudgetDiffRow(action: action, existingBudget: existingBudget(for: action))
+                    }
+                    if budgetActions.count > 8 {
+                        Text("+\(budgetActions.count - 8) more budget edit\(budgetActions.count - 8 == 1 ? "" : "s")")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+            }
+
+            if !classifications.isEmpty {
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("Classifications")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                    ForEach(classifications.prefix(8)) { item in
+                        BudgetAssistantClassificationDiffRow(classification: item, transaction: transaction(for: item))
+                    }
+                    if classifications.count > 8 {
+                        Text("+\(classifications.count - 8) more classification\(classifications.count - 8 == 1 ? "" : "s")")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+            }
+        }
+        .padding(16)
+        .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 22, style: .continuous))
+    }
+
+    private func existingBudget(for action: BudgetAssistantBudgetAction) -> Budget? {
+        let normalized = action.categoryName.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return budgets.first { $0.categoryName.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == normalized }
+    }
+
+    private func transaction(for classification: BudgetAssistantClassification) -> Transaction? {
+        transactions.first { $0.id == classification.transactionID }
+    }
+}
+
+private struct BudgetAssistantBudgetDiffRow: View {
+    let action: BudgetAssistantBudgetAction
+    let existingBudget: Budget?
+
+    private var operation: String {
+        action.operation.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? (existingBudget == nil ? "Create" : "Update") : action.operation.capitalized
+    }
+
+    private var tint: Color {
+        switch action.operation.lowercased() {
+        case "delete", "remove": .red
+        case "update": .accentColor
+        default: AppDesign.positive
+        }
+    }
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 10) {
+            Text(operation)
+                .font(.caption.weight(.bold))
+                .foregroundStyle(tint)
+                .frame(width: 58, alignment: .leading)
+            VStack(alignment: .leading, spacing: 3) {
+                Text(action.categoryName)
+                    .lineLimit(1)
+                if action.operation.lowercased() == "delete" || action.operation.lowercased() == "remove" {
+                    Text(existingBudget == nil ? "No existing budget found" : "Remove current \(existingBudget!.period) limit of \(AppDesign.money(existingBudget!.limitCents))")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                } else if let existingBudget {
+                    Text("\(existingBudget.period.capitalized) \(AppDesign.money(existingBudget.limitCents)) → \(action.period.capitalized) \(AppDesign.money(action.limitCents))")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                } else {
+                    Text("New \(action.period) limit \(AppDesign.money(action.limitCents))")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            Spacer()
+        }
+        .font(.subheadline)
+    }
+}
+
+private struct BudgetAssistantClassificationDiffRow: View {
+    let classification: BudgetAssistantClassification
+    let transaction: Transaction?
+
+    private var currentCategory: String {
+        transaction?.categorySplits?.first?.name ?? "Uncategorized"
+    }
+
+    private var subtitle: String {
+        guard let transaction else {
+            return "Transaction not loaded · \(Int((classification.confidence * 100).rounded()))% confidence"
+        }
+        return "\(transaction.postedAt.formatted(date: .abbreviated, time: .omitted)) · \(AppDesign.money(transaction.amountCents)) · \(Int((classification.confidence * 100).rounded()))% confidence"
+    }
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 10) {
+            Image(systemName: "tag")
+                .foregroundStyle(AppDesign.positive)
+                .frame(width: 22)
+            VStack(alignment: .leading, spacing: 3) {
+                Text(transaction?.merchantName ?? transaction?.description ?? "Transaction")
+                    .lineLimit(1)
+                Text("\(currentCategory) → \(classification.categoryName)")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                Text(subtitle)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                if !classification.reason.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    Text(classification.reason)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(2)
+                }
+                if classification.applyToSimilar {
+                    Label("Also applies to similar transactions", systemImage: "arrow.triangle.branch")
+                        .font(.caption2.weight(.medium))
+                        .foregroundStyle(AppDesign.positive)
+                }
+            }
+            Spacer()
+        }
+        .font(.subheadline)
+    }
+}
+
 private struct BudgetAssistantStat: View {
     let label: String
     let value: Int
@@ -711,6 +1304,153 @@ private struct BudgetAssistantStat: View {
         .padding(10)
         .frame(maxWidth: .infinity)
         .background(AppDesign.panel.opacity(0.8), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+    }
+}
+
+private struct BudgetAssistantHistoryView: View {
+    @Bindable var store: FinanceStore
+    let open: (BudgetAssistantReply) -> Void
+    @Environment(\.dismiss) private var dismiss
+    @State private var proposals: [BudgetAssistantReply] = []
+    @State private var isLoading = false
+    @State private var errorMessage: String?
+
+    var body: some View {
+        NavigationStack {
+            List {
+                if let errorMessage {
+                    Section {
+                        Text(errorMessage)
+                            .foregroundStyle(.red)
+                    }
+                }
+                if proposals.isEmpty && !isLoading {
+                    ContentUnavailableView {
+                        Label("No Proposal History", systemImage: "clock")
+                    } description: {
+                        Text("Ask Budget AI to plan categories or classify spending, then proposals will appear here.")
+                    }
+                } else {
+                    Section("Recent plans") {
+                        ForEach(proposals, id: \.id) { proposal in
+                            Button {
+                                open(proposal)
+                                dismiss()
+                            } label: {
+                                BudgetAssistantHistoryRow(proposal: proposal)
+                            }
+                            .buttonStyle(.plain)
+                        }
+                    }
+                }
+            }
+            .overlay {
+                if isLoading {
+                    ProgressView("Loading proposals…")
+                }
+            }
+            .navigationTitle("Proposal History")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Done") { dismiss() }
+                }
+                ToolbarItem(placement: .primaryAction) {
+                    Button {
+                        Task { await load() }
+                    } label: {
+                        Image(systemName: "arrow.clockwise")
+                    }
+                    .disabled(isLoading)
+                }
+            }
+            .task {
+                await load()
+            }
+        }
+    }
+
+    private func load() async {
+        guard !isLoading else { return }
+        isLoading = true
+        errorMessage = nil
+        defer { isLoading = false }
+        do {
+            proposals = try await store.budgetAssistantProposals()
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+    }
+}
+
+private struct BudgetAssistantHistoryRow: View {
+    let proposal: BudgetAssistantReply
+
+    private var statusColor: Color {
+        switch proposal.normalizedMode {
+        case "pending", "proposal": AppDesign.warning
+        case "applied": AppDesign.positive
+        case "dismissed": .secondary
+        default: .accentColor
+        }
+    }
+
+    private var statusLabel: String {
+        switch proposal.normalizedMode {
+        case "pending", "proposal": "Pending"
+        case "applied": "Applied"
+        case "dismissed": "Dismissed"
+        default: proposal.normalizedMode.capitalized
+        }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(alignment: .top) {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(proposal.reply)
+                        .font(.headline)
+                        .lineLimit(2)
+                    Text(proposal.createdAt.formatted(date: .abbreviated, time: .shortened))
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+                Text(statusLabel)
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(statusColor)
+                    .padding(.horizontal, 9)
+                    .padding(.vertical, 5)
+                    .background(statusColor.opacity(0.14), in: Capsule())
+            }
+            HStack(spacing: 8) {
+                BudgetAssistantMiniStat(label: "Budget", value: proposal.createdBudgets + proposal.updatedBudgets + proposal.deletedBudgets)
+                BudgetAssistantMiniStat(label: "Classify", value: proposal.classified)
+                BudgetAssistantMiniStat(label: "Review", value: proposal.needsReview)
+            }
+            Label(proposal.normalizedMode == "applied" ? "Open applied plan details" : "Open plan for review", systemImage: proposal.normalizedMode == "applied" ? "checkmark.seal" : "doc.text.magnifyingglass")
+                .font(.caption.weight(.medium))
+                .foregroundStyle(.secondary)
+        }
+        .padding(.vertical, 6)
+    }
+}
+
+private struct BudgetAssistantMiniStat: View {
+    let label: String
+    let value: Int
+
+    var body: some View {
+        HStack(spacing: 4) {
+            Text("\(value)")
+                .font(.caption.weight(.bold).monospacedDigit())
+            Text(label)
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 5)
+        .background(AppDesign.panel, in: Capsule())
     }
 }
 
@@ -809,6 +1549,11 @@ private struct BudgetDetailView: View {
             (transaction.categorySplits ?? []).contains { $0.categoryID == budget.categoryID || $0.name.localizedCaseInsensitiveCompare(budget.categoryName) == .orderedSame }
         }
     }
+    private var unassignedExpenseCount: Int {
+        allMonthTransactions.filter { transaction in
+            transaction.amountCents < 0 && !(transaction.categorySplits ?? []).contains { $0.categoryID == budget.categoryID || $0.name.localizedCaseInsensitiveCompare(budget.categoryName) == .orderedSame }
+        }.count
+    }
 
     var body: some View {
         List {
@@ -837,25 +1582,50 @@ private struct BudgetDetailView: View {
                 BudgetDetailRow(label: "Category ID", value: budget.categoryID)
             }
             Section {
+                Button {
+                    isAssigning = true
+                    showingTransactionPicker = true
+                } label: {
+                    HStack {
+                        Label("Add or reclassify transactions", systemImage: "plus.circle.fill")
+                        Spacer()
+                        Text("\(unassignedExpenseCount) available")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                if isAssigning {
+                    Text("Swipe an assigned transaction to remove it from this budget, or tap plus to add more from this month.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            } header: {
+                Text("Classification")
+            }
+            Section {
                 if categoryTransactions.isEmpty {
                     Text("No transactions have hit this category in \(month.formatted(.dateTime.month(.wide))).")
                         .foregroundStyle(.secondary)
                 } else {
                     ForEach(categoryTransactions.prefix(60)) { transaction in
                         BudgetTransactionRow(transaction: transaction)
+                            .swipeActions(edge: .trailing, allowsFullSwipe: false) {
+                                if isAssigning {
+                                    Button(role: .destructive) {
+                                        Task { await store.updateTransactionCategory(transaction, categoryName: "Uncategorized", applyToSimilar: false) }
+                                    } label: {
+                                        Label("Remove", systemImage: "xmark.circle")
+                                    }
+                                }
+                            }
                     }
                 }
             } header: {
                 HStack {
-                    Text(month.formatted(.dateTime.month(.wide)))
+                    Text("\(month.formatted(.dateTime.month(.wide))) Transactions")
                     Spacer()
-                    if isAssigning {
-                        Button {
-                            showingTransactionPicker = true
-                        } label: {
-                            Image(systemName: "plus.circle.fill")
-                        }
-                    }
+                    Text("\(categoryTransactions.count)")
+                        .foregroundStyle(.secondary)
                 }
             }
             Section {
@@ -904,12 +1674,16 @@ private struct BudgetDetailView: View {
 private struct BudgetTransactionRow: View {
     let transaction: Transaction
 
+    private var categoryLabel: String {
+        transaction.categorySplits?.first?.name ?? "Uncategorized"
+    }
+
     var body: some View {
         HStack {
             VStack(alignment: .leading, spacing: 3) {
                 Text(transaction.merchantName ?? transaction.description)
                     .lineLimit(1)
-                Text(transaction.postedAt.formatted(date: .abbreviated, time: .omitted))
+                Text("\(transaction.postedAt.formatted(date: .abbreviated, time: .omitted)) · \(categoryLabel)")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -944,11 +1718,42 @@ private struct BudgetTransactionPickerView: View {
                 return (transaction.merchantName ?? transaction.description).localizedCaseInsensitiveContains(trimmed) || transaction.description.localizedCaseInsensitiveContains(trimmed)
             }
     }
+    private var selectedTransactions: [Transaction] {
+        candidates.filter { selectedIDs.contains($0.id) }
+    }
+    private var selectedTotal: Int64 {
+        selectedTransactions.reduce(Int64(0)) { $0 + abs(min(0, $1.amountCents)) }
+    }
 
     var body: some View {
         NavigationStack {
             List {
                 Section {
+                    HStack {
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text("\(selectedIDs.count) selected")
+                                .font(.headline)
+                            Text(AppDesign.money(selectedTotal))
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                                .monospacedDigit()
+                        }
+                        Spacer()
+                        Button(selectedIDs.isEmpty ? "Select visible" : "Clear") {
+                            if selectedIDs.isEmpty {
+                                selectedIDs = Set(candidates.map(\.id))
+                            } else {
+                                selectedIDs.removeAll()
+                            }
+                        }
+                        .buttonStyle(.bordered)
+                        .disabled(candidates.isEmpty)
+                    }
+                }
+                Section {
+                    if candidates.isEmpty {
+                        ContentUnavailableView("No Matching Transactions", systemImage: "line.3.horizontal.decrease.circle", description: Text("Try a different search or pick another month."))
+                    }
                     ForEach(candidates) { transaction in
                         Button {
                             toggle(transaction.id)
@@ -964,7 +1769,7 @@ private struct BudgetTransactionPickerView: View {
                 } header: {
                     Text("Transactions in \(month.formatted(.dateTime.month(.wide).year()))")
                 } footer: {
-                    Text("Selected transactions will be assigned to \(budget.categoryName).")
+                    Text("Selected transactions will be assigned to \(budget.categoryName). Existing categories are replaced only for the selected transaction, not for similar merchants.")
                 }
             }
             .searchable(text: $query, prompt: "Search transactions")
@@ -1126,6 +1931,11 @@ private struct BudgetEditorView: View {
                     .padding(.vertical, 2)
                 }
             }
+            if let categorySpendHint {
+                Label(categorySpendHint, systemImage: "chart.line.uptrend.xyaxis")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
         }
     }
 
@@ -1146,16 +1956,61 @@ private struct BudgetEditorView: View {
             .padding(.vertical, 12)
             .background(AppDesign.panel.opacity(0.9), in: RoundedRectangle(cornerRadius: 18, style: .continuous))
 
-            HStack(spacing: 8) {
-                ForEach([100, 250, 500, 1000], id: \.self) { amount in
-                    Button("$\(amount)") {
-                        limitDollars = "\(amount)"
-                    }
+            VStack(alignment: .leading, spacing: 10) {
+                Text("Quick amounts")
                     .font(.caption.weight(.semibold))
-                    .buttonStyle(.bordered)
+                    .foregroundStyle(.secondary)
+                HStack(spacing: 8) {
+                    ForEach(amountPresets, id: \.self) { amount in
+                        Button("$\(amount)") {
+                            limitDollars = "\(amount)"
+                        }
+                        .font(.caption.weight(.semibold))
+                        .buttonStyle(.bordered)
+                    }
+                }
+                if cents(from: limitDollars) > 0 {
+                    Text(equivalentLimitText)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
                 }
             }
         }
+    }
+
+    private var amountPresets: [Int] {
+        draft.period == "weekly" ? [50, 100, 150, 250] : [100, 250, 500, 1000]
+    }
+
+    private var equivalentLimitText: String {
+        let limit = cents(from: limitDollars)
+        if draft.period == "weekly" {
+            return "About \(AppDesign.money(limit * 4)) available across a four-week month."
+        }
+        return "About \(AppDesign.money(limit / 4)) available per week."
+    }
+
+    private var validationMessage: String? {
+        if draft.categoryName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return "Add a category name."
+        }
+        if cents(from: limitDollars) <= 0 {
+            return "Set a budget limit greater than $0."
+        }
+        return nil
+    }
+
+    private var categorySpendHint: String? {
+        let normalized = draft.categoryName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalized.isEmpty else { return nil }
+        let monthlySpend = store.cashflowTrendTransactions
+            .filter { $0.amountCents < 0 }
+            .filter { transaction in
+                (transaction.categorySplits ?? []).contains { $0.name.localizedCaseInsensitiveCompare(normalized) == .orderedSame }
+            }
+            .reduce(Int64(0)) { $0 + abs($1.amountCents) }
+        guard monthlySpend > 0 else { return nil }
+        return "Tracked spending in this category is \(AppDesign.money(monthlySpend)) in loaded history."
     }
 
     private var periodCard: some View {
@@ -1200,6 +2055,12 @@ private struct BudgetEditorView: View {
 
     private var saveBar: some View {
         VStack(spacing: 10) {
+            if let validationMessage {
+                Text(validationMessage)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
             Button {
                 save()
             } label: {
